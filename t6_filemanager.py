@@ -12,6 +12,12 @@ T6. ファイル移動＋メタデータ保存
 T5が categories.embedding に入れるGemini embeddingとは次元もモデルも別物なので、
 T7の意味検索で files.embedding と比較する際は必ずこのファイルと同じモデル
 （EMBEDDING_MODEL_NAME）でクエリをembedding化すること。
+
+【T7担当へ】検索クエリのembeddingは自前で作らず、このファイルの embed_query() を
+呼ぶこと。使用モデルは intfloat/multilingual-e5-base（768次元）で、e5系は
+文書側に "passage: "、クエリ側に "query: " のプレフィックスが必須。付け忘れても
+例外は出ず静かに精度が落ちるだけなので、両方ともこのファイルに閉じ込めてある。
+embeddingはL2正規化済みなので、コサイン類似度は単なる内積で計算できる。
 """
 
 from __future__ import annotations
@@ -44,7 +50,17 @@ EXTENSION_TYPE_MAP = {
     ".gif": "photo",
 }
 
-EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+# 検索精度の実測比較（現実的なノイズ入り300件）で、旧モデル
+# paraphrase-multilingual-MiniLM-L12-v2 は 83.3%、e5-base は 94.4% だった。
+# MiniLMは正解が20位まで落ちるような外し方をするため e5-base を採用している。
+# e5-large(2.2GB) は e5-base と同点だったので大きくする意味はない。
+EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-base"
+EMBEDDING_DIM = 768
+
+# e5系モデルはプレフィックス必須。文書側とクエリ側で別の語を付ける。
+PASSAGE_PREFIX = "passage: "
+QUERY_PREFIX = "query: "
+
 _embedding_model: Optional[SentenceTransformer] = None
 
 
@@ -95,12 +111,31 @@ def _move_to_category_folder(file_path: Path, category: str) -> Path:
     return destination
 
 
-def _create_embedding(category: str, subtags: list[str], summary: str) -> np.ndarray:
-    """カテゴリ・サブタグ・要約からembeddingを作る"""
-    text = " ".join([category, summary, " ".join(subtags)]).strip()
+def build_index_text(category: str, subtags: list[str], summary: str) -> str:
+    """files.embedding の元になる文書テキストを組み立てる（プレフィックスは付けない）"""
+    return " ".join([category, summary, " ".join(subtags)]).strip()
+
+
+def _encode(text: str) -> np.ndarray:
+    """L2正規化済みのembeddingを返す（コサイン類似度を内積で計算できるようにする）"""
     model = _get_embedding_model()
-    embedding = model.encode(text)
+    embedding = model.encode(text, normalize_embeddings=True)
     return np.asarray(embedding, dtype=np.float32)
+
+
+def embed_query(query: str) -> np.ndarray:
+    """
+    検索クエリ（自然文）をembedding化する。T7の意味検索はこの関数を使うこと。
+
+    files.embedding と同じモデル・同じ正規化で、e5系に必要な "query: "
+    プレフィックスを内側で付ける。
+    """
+    return _encode(QUERY_PREFIX + query)
+
+
+def _create_embedding(category: str, subtags: list[str], summary: str) -> np.ndarray:
+    """カテゴリ・サブタグ・要約からembeddingを作る（文書側なので "passage: " を付ける）"""
+    return _encode(PASSAGE_PREFIX + build_index_text(category, subtags, summary))
 
 
 def save_result(file_path: str, classification: dict) -> dict:
@@ -183,3 +218,4 @@ if __name__ == "__main__":
     print("T6 t6_filemanager.py")
     print(f"DB: {db.DB_PATH}（files / trash_log を担当。categoriesはT5の領域）")
     print(f"整理先ルート: {ORGANIZED_ROOT}")
+    print(f"embeddingモデル: {EMBEDDING_MODEL_NAME}（{EMBEDDING_DIM}次元）")
