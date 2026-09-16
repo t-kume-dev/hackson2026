@@ -37,11 +37,11 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontDatabase,
     QIcon,
     QPainter,
-    QPainterPath,
     QPixmap,
-    QRadialGradient,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -67,20 +67,42 @@ from t1_watch import watch_folder
 
 logger = logging.getLogger(__name__)
 
-# 見た目のトーン。モックと同じ配色。
-INK = "#23262e"
-DIM = "#6b7280"
-PANEL = "#fbfaf8"
-SUNK = "#f2efea"
-LINE = "#e3e1dc"
-TEAL = "#1f6f66"
-AMBER = "#d9873a"
-DANGER = "#b3413a"
+# 見た目は白黒のドット絵。色は使わず、黒地に白文字・白枠で統一する。
+# 角丸も影もグラデーションも使わない（ドット絵の質感が濁るため）。
+BLACK = "#000000"
+WHITE = "#ffffff"
+DIM = "#9a9a9a"      # 補助テキスト。白のままだと主役の文字と区別がつかないため
+LINE = "#ffffff"     # 枠線は常に白
+SUNK = "#141414"     # わずかに明るい黒。面の切り替わりを示すためだけに使う
 
 # 通知の吹き出しが消えるまでの時間。作業中に居座られるのが一番嫌われるので短く。
 TOAST_MS = 5000
 
-FONT = '"Yu Gothic UI", "Meiryo", sans-serif'
+# ドット絵フォント。assets/fonts に同梱した DotGothic16（SIL OFL）を起動時に登録する。
+# 読み込めなかった環境では MS Gothic に落ちる（小さいサイズでビットマップ的に出るため）。
+FONT_FILE = Path(__file__).parent / "assets" / "fonts" / "DotGothic16-Regular.ttf"
+FONT = '"DotGothic16", "MS Gothic", monospace'
+
+
+def _load_pixel_font() -> None:
+    """同梱のドット絵フォントをアプリに登録する。QApplication生成後に呼ぶこと。"""
+    if not FONT_FILE.exists():
+        logger.warning(f"[UI] フォントが見つかりません: {FONT_FILE}")
+        return
+    if QFontDatabase.addApplicationFont(str(FONT_FILE)) < 0:
+        logger.warning(f"[UI] フォントを読み込めませんでした: {FONT_FILE}")
+
+
+def _stylize(html: str) -> str:
+    """
+    <b>…</b> を白黒反転の帯に置き換える。
+
+    ドット絵フォントには太字が無く、そのまま使うと疑似太字で文字が滲む。
+    色も使わない方針なので、強調は「白地に黒文字」の反転で表す。
+    """
+    return html.replace(
+        "<b>", f"<span style='background:{WHITE}; color:{BLACK};'>&nbsp;"
+    ).replace("</b>", "&nbsp;</span>")
 
 
 # ---------------------------------------------------------------------------
@@ -135,19 +157,19 @@ class SearchThread(QThread):
 
 def _button(text: str, kind: str = "plain") -> QPushButton:
     """会話ログの中に置く小さなボタン。"""
-    colors = {
-        "plain": (PANEL, INK, LINE),
-        "primary": (TEAL, "#ffffff", TEAL),
-        "danger": (PANEL, DANGER, "#e8cdcb"),
-    }
-    bg, fg, border = colors[kind]
+    # primaryは白地に黒抜き（反転）で強調する。色を使わないぶん明暗で差をつける。
+    if kind == "primary":
+        bg, fg = WHITE, BLACK
+    else:
+        bg, fg = BLACK, WHITE
+
     b = QPushButton(text)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     b.setStyleSheet(
-        f"QPushButton {{ background:{bg}; color:{fg}; border:1px solid {border};"
-        f" border-radius:7px; padding:4px 10px; font-size:11px; font-family:{FONT}; }}"
-        f"QPushButton:hover {{ background:{SUNK}; }}"
-        f"QPushButton:disabled {{ color:#b6bac0; border-color:{LINE}; background:{PANEL}; }}"
+        f"QPushButton {{ background:{bg}; color:{fg}; border:2px solid {WHITE};"
+        f" border-radius:0px; padding:4px 10px; font-size:11px; font-family:{FONT}; }}"
+        f"QPushButton:hover {{ background:{WHITE}; color:{BLACK}; }}"
+        f"QPushButton:disabled {{ color:{DIM}; border-color:{DIM}; background:{BLACK}; }}"
     )
     return b
 
@@ -163,23 +185,37 @@ def _human_size(size: int) -> str:
 class Bubble(QFrame):
     """会話の吹き出し1つ。"""
 
+    MAX_WIDTH = 300
+
     def __init__(self, text: str, mine: bool = False) -> None:
         super().__init__()
-        bg, fg = (TEAL, "#ffffff") if mine else (SUNK, INK)
-        radius = "13px 13px 4px 13px" if mine else "13px 13px 13px 4px"
+        # 自分の発言は白地に黒、コハクの発言は黒地に白枠。
+        bg, fg = (WHITE, BLACK) if mine else (BLACK, WHITE)
         self.setStyleSheet(
-            f"QFrame {{ background:{bg}; border-radius:13px;"
-            f" border-bottom-{'right' if mine else 'left'}-radius:4px; }}"
+            f"QFrame {{ background:{bg}; border:2px solid {WHITE}; border-radius:0px; }}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 9, 12, 9)
-        label = QLabel(text)
+        label = QLabel(_stylize(text))
         label.setWordWrap(True)
         label.setTextFormat(Qt.TextFormat.RichText)
-        label.setStyleSheet(f"color:{fg}; font-size:12px; font-family:{FONT}; background:transparent;")
+        label.setStyleSheet(
+            f"color:{fg}; font-size:12px; font-family:{FONT}; background:transparent; border:0;"
+        )
         layout.addWidget(label)
         self.content_layout = layout
-        self.setMaximumWidth(300)
+        self.setMaximumWidth(self.MAX_WIDTH)
+
+        # 折り返し付きのQLabelは、横に余裕があっても最小幅まで縮んで早く折り返す。
+        # 一番長い行の幅を測り、吹き出しの上限までは1行で収まるように幅を確保する。
+        plain = QTextDocument()
+        plain.setHtml(text)
+        metrics = label.fontMetrics()
+        longest = max(
+            (metrics.horizontalAdvance(line) for line in plain.toPlainText().splitlines()),
+            default=0,
+        )
+        label.setMinimumWidth(min(longest + 16, self.MAX_WIDTH - 28))
 
 
 class FileCard(QFrame):
@@ -190,7 +226,7 @@ class FileCard(QFrame):
         self.file = file
         self.panel = panel
         self.setStyleSheet(
-            f"QFrame#card {{ background:{PANEL}; border:1px solid {LINE}; border-radius:11px; }}"
+            f"QFrame#card {{ background:{BLACK}; border:2px solid {WHITE}; border-radius:0px; }}"
         )
         self.setObjectName("card")
 
@@ -201,12 +237,10 @@ class FileCard(QFrame):
         badge = QLabel({"pdf": "PDF", "photo": "IMG", "text": "TXT"}.get(file["filetype"], "?"))
         badge.setFixedSize(40, 50)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        color = {"pdf": "#a8453f", "photo": "#2f6f8f", "text": "#5a6570"}.get(
-            file["filetype"], "#5a6570"
-        )
+        # 種別は色ではなく文字で見分ける。白地に黒のタグにして目立たせる。
         badge.setStyleSheet(
-            f"background:{color}; color:#fff; border-radius:5px;"
-            f" font-size:9px; font-weight:700; font-family:{FONT};"
+            f"background:{WHITE}; color:{BLACK}; border:0; border-radius:0px;"
+            f" font-size:10px; font-family:{FONT};"
         )
         outer.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
 
@@ -215,16 +249,18 @@ class FileCard(QFrame):
 
         name = QLabel(file["filename"])
         name.setWordWrap(True)
-        name.setStyleSheet(f"color:{INK}; font-size:11.5px; font-weight:700; font-family:{FONT};")
+        name.setStyleSheet(
+            f"color:{WHITE}; font-size:12px; font-family:{FONT}; border:0;"
+        )
         body.addWidget(name)
 
         meta = QLabel(f"{file['category']} ・ {_human_size(file['file_size'])}")
-        meta.setStyleSheet(f"color:{DIM}; font-size:10px; font-family:{FONT};")
+        meta.setStyleSheet(f"color:{DIM}; font-size:10px; font-family:{FONT}; border:0;")
         body.addWidget(meta)
 
         summary = QLabel(file["summary"])
         summary.setWordWrap(True)
-        summary.setStyleSheet(f"color:{DIM}; font-size:10.5px; font-family:{FONT};")
+        summary.setStyleSheet(f"color:{DIM}; font-size:10.5px; font-family:{FONT}; border:0;")
         body.addWidget(summary)
 
         actions = QHBoxLayout()
@@ -286,7 +322,7 @@ class ChatPanel(QWidget):
         frame = QFrame()
         frame.setObjectName("panel")
         frame.setStyleSheet(
-            f"QFrame#panel {{ background:{PANEL}; border:1px solid {LINE}; border-radius:14px; }}"
+            f"QFrame#panel {{ background:{BLACK}; border:2px solid {WHITE}; border-radius:0px; }}"
         )
         root.addWidget(frame)
 
@@ -299,10 +335,17 @@ class ChatPanel(QWidget):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setStyleSheet("background:transparent;")
+        self.scroll.setStyleSheet(
+            f"QScrollArea {{ background:{BLACK}; border:0; }}"
+            f"QScrollBar:vertical {{ background:{BLACK}; width:8px; margin:0; }}"
+            f"QScrollBar::handle:vertical {{ background:{WHITE}; min-height:24px; }}"
+            f"QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}"
+            f"QScrollBar::add-page, QScrollBar::sub-page {{ background:{BLACK}; }}"
+        )
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.log_widget = QWidget()
+        self.log_widget.setStyleSheet(f"background:{BLACK};")
         self.log = QVBoxLayout(self.log_widget)
         self.log.setContentsMargins(14, 14, 14, 14)
         self.log.setSpacing(10)
@@ -322,12 +365,15 @@ class ChatPanel(QWidget):
 
     def _build_header(self) -> QWidget:
         header = QWidget()
-        header.setStyleSheet(f"border-bottom:1px solid {LINE};")
+        header.setObjectName("header")
+        header.setStyleSheet(
+            f"QWidget#header {{ background:{BLACK}; border-bottom:2px solid {WHITE}; }}"
+        )
         row = QHBoxLayout(header)
         row.setContentsMargins(14, 10, 10, 10)
 
         title = QLabel("コハク")
-        title.setStyleSheet(f"color:{INK}; font-size:12.5px; font-weight:700; font-family:{FONT};")
+        title.setStyleSheet(f"color:{WHITE}; font-size:13px; font-family:{FONT};")
         row.addWidget(title)
 
         self.status = QLabel("ダウンロードフォルダを見張り中")
@@ -339,8 +385,9 @@ class ChatPanel(QWidget):
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.setFixedSize(24, 24)
         close.setStyleSheet(
-            f"QPushButton {{ border:0; color:{DIM}; font-size:15px; background:transparent; }}"
-            f"QPushButton:hover {{ background:{SUNK}; border-radius:6px; }}"
+            f"QPushButton {{ border:0; color:{WHITE}; font-size:15px; background:transparent;"
+            f" font-family:{FONT}; }}"
+            f"QPushButton:hover {{ background:{WHITE}; color:{BLACK}; }}"
         )
         close.clicked.connect(self.hide_panel)
         row.addWidget(close)
@@ -348,7 +395,10 @@ class ChatPanel(QWidget):
 
     def _build_composer(self) -> QWidget:
         box = QWidget()
-        box.setStyleSheet(f"border-top:1px solid {LINE};")
+        box.setObjectName("composer")
+        box.setStyleSheet(
+            f"QWidget#composer {{ background:{BLACK}; border-top:2px solid {WHITE}; }}"
+        )
         row = QHBoxLayout(box)
         row.setContentsMargins(12, 10, 12, 10)
         row.setSpacing(8)
@@ -356,19 +406,21 @@ class ChatPanel(QWidget):
         self.input = QLineEdit()
         self.input.setPlaceholderText("探しものを言葉で（例：先週の統計学の資料）")
         self.input.setStyleSheet(
-            f"QLineEdit {{ background:{SUNK}; border:1px solid {LINE}; border-radius:9px;"
-            f" padding:7px 10px; font-size:12px; color:{INK}; font-family:{FONT}; }}"
-            f"QLineEdit:focus {{ border-color:{AMBER}; }}"
+            f"QLineEdit {{ background:{BLACK}; border:2px solid {DIM}; border-radius:0px;"
+            f" padding:6px 9px; font-size:12px; color:{WHITE}; font-family:{FONT};"
+            f" selection-background-color:{WHITE}; selection-color:{BLACK}; }}"
+            f"QLineEdit:focus {{ border-color:{WHITE}; }}"
         )
         self.input.returnPressed.connect(self._submit)
         row.addWidget(self.input, 1)
 
-        send = QPushButton("↑")
+        send = QPushButton("▶")
         send.setCursor(Qt.CursorShape.PointingHandCursor)
         send.setFixedSize(32, 32)
         send.setStyleSheet(
-            f"QPushButton {{ background:{AMBER}; color:#fff; border:0; border-radius:9px;"
-            f" font-size:14px; }}"
+            f"QPushButton {{ background:{WHITE}; color:{BLACK}; border:0; border-radius:0px;"
+            f" font-size:12px; }}"
+            f"QPushButton:pressed {{ background:{DIM}; }}"
         )
         send.clicked.connect(self._submit)
         row.addWidget(send)
@@ -485,7 +537,7 @@ class ChatPanel(QWidget):
 
         head = f"これかな。{len(result.hits)}件あったよ。"
         if result.filters:
-            head += f"<br><span style='color:{AMBER};'>{' / '.join(result.filters)}</span> で絞り込んでいます。"
+            head += f"<br>[{' / '.join(result.filters)}] で絞り込んでいます。"
         self.say(head)
         self.add_cards([hit.file for hit in result.hits])
 
@@ -597,7 +649,7 @@ class Toast(QWidget):
         self.frame = QFrame()
         self.frame.setObjectName("toast")
         self.frame.setStyleSheet(
-            f"QFrame#toast {{ background:{PANEL}; border:1px solid {LINE}; border-radius:13px; }}"
+            f"QFrame#toast {{ background:{BLACK}; border:2px solid {WHITE}; border-radius:0px; }}"
         )
         root.addWidget(self.frame)
 
@@ -608,7 +660,9 @@ class Toast(QWidget):
         self.label = QLabel()
         self.label.setWordWrap(True)
         self.label.setTextFormat(Qt.TextFormat.RichText)
-        self.label.setStyleSheet(f"color:{INK}; font-size:12px; font-family:{FONT};")
+        self.label.setStyleSheet(
+            f"color:{WHITE}; font-size:12px; font-family:{FONT}; border:0; background:transparent;"
+        )
         self.box.addWidget(self.label)
 
         self.actions = QHBoxLayout()
@@ -620,7 +674,7 @@ class Toast(QWidget):
         self.timer.timeout.connect(self.hide)
 
     def show_message(self, html: str, actions: list[tuple[str, str, object]], at: QPoint) -> None:
-        self.label.setText(html)
+        self.label.setText(_stylize(html))
 
         while self.actions.count():
             item = self.actions.takeAt(0)
@@ -644,6 +698,91 @@ class Toast(QWidget):
 # 常駐キャラ
 # ---------------------------------------------------------------------------
 
+# ドット絵。 "." = 透明 / "#" = 黒 / "o" = 白。
+# 白い体に黒い縁取りなので、明るい壁紙でも暗い壁紙でも輪郭が消えない。
+# 口が大きいのはファイルを食べるキャラだから。
+
+# 普段: 口を閉じている
+SPRITE_IDLE = [
+    "....########....",
+    "..##oooooooo##..",
+    ".#oooooooooooo#.",
+    "#oooooooooooooo#",
+    "#o##oooooooo##o#",
+    "#o##oooooooo##o#",
+    "#oooooooooooooo#",
+    "#oooooooooooooo#",
+    "#ooo########ooo#",
+    "#oooooooooooooo#",
+    ".#oooooooooooo#.",
+    "..##oooooooo##..",
+    "....########....",
+]
+
+# 食べる途中: 口が半開き
+SPRITE_OPEN = [
+    "....########....",
+    "..##oooooooo##..",
+    ".#oooooooooooo#.",
+    "#oooooooooooooo#",
+    "#o##oooooooo##o#",
+    "#o##oooooooo##o#",
+    "#oooooooooooooo#",
+    "#oo##########oo#",
+    "#oo##########oo#",
+    "#oooooooooooooo#",
+    ".#oooooooooooo#.",
+    "..##oooooooo##..",
+    "....########....",
+]
+
+# 食べる瞬間: 口をあんぐり開ける（目も上に押し上げられる）
+SPRITE_WIDE = [
+    "....########....",
+    "..##oooooooo##..",
+    ".#o##oooooo##o#.",
+    "#oo##oooooo##oo#",
+    "#oooooooooooooo#",
+    "#o############o#",
+    "#o############o#",
+    "#o############o#",
+    "#o############o#",
+    "#o############o#",
+    ".#oooooooooooo#.",
+    "..##oooooooo##..",
+    "....########....",
+]
+
+# 食べられる側のファイル（右上の角が折れた紙）
+SPRITE_FILE = [
+    "####..",
+    "#oo#o.",
+    "#oo###",
+    "#oooo#",
+    "#o##o#",
+    "#oooo#",
+    "######",
+]
+
+# 呼吸の上下（ドット単位）。ゆっくり上がって、ゆっくり下がる。
+BREATH_PATTERN = [0, 0, 0, 1, 1, 1]
+
+# 食べるときの1サイクル。ファイルが口に近づく間は口を開け続け、
+# 飲み込んだ瞬間に閉じて、もぐもぐしてからまた開く。
+CHOMP_STEPS = 12
+CHOMP_SWALLOW_AT = 7   # このステップでファイルが消えて口が閉じる
+
+
+def _draw_sprite(painter: QPainter, sprite: list[str], ox: int, oy: int, px: int) -> None:
+    """文字列のドット絵を px 四方のブロックで描く。"""
+    black = QColor(BLACK)
+    white = QColor(WHITE)
+    for y, row in enumerate(sprite):
+        for x, cell in enumerate(row):
+            if cell == ".":
+                continue
+            painter.fillRect(ox + x * px, oy + y * px, px, px, black if cell == "#" else white)
+
 class Mascot(QWidget):
     """
     枠なし・背景透過・常に最前面の小さなウィンドウ。
@@ -652,7 +791,13 @@ class Mascot(QWidget):
 
     clicked = Signal()
 
-    SIZE = 86
+    PIXEL = 4                                  # ドット1つの大きさ（画面上のpx）
+    BODY_W = len(SPRITE_IDLE[0]) * PIXEL       # 体の幅
+    BODY_H = len(SPRITE_IDLE) * PIXEL          # 体の高さ
+    # 右側は食べられるファイルが飛んでくるための余白。上は呼吸で浮くぶんの余白。
+    WIDTH = BODY_W + 8 * PIXEL
+    HEIGHT = BODY_H + 2 * PIXEL
+    TICK_MS = 120
 
     def __init__(self, app_state: "Kohaku") -> None:
         super().__init__()
@@ -663,7 +808,7 @@ class Mascot(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._drag_origin: Optional[QPoint] = None
@@ -677,11 +822,11 @@ class Mascot(QWidget):
         self.topmost_timer.timeout.connect(self.ensure_on_top)
         self.topmost_timer.start(1500)
 
-        # 処理中の明滅
-        self.phase = 0.0
+        # アニメーション。普段は呼吸、分類中はファイルを食べる。
+        self.tick = 0
         self.animation = QTimer(self)
         self.animation.timeout.connect(self._tick)
-        self.animation.start(60)
+        self.animation.start(self.TICK_MS)
 
     def ensure_on_top(self) -> None:
         """
@@ -709,44 +854,61 @@ class Mascot(QWidget):
         self.raise_()
 
     def _tick(self) -> None:
-        if self.working:
-            self.phase += 0.12
-            self.update()
+        self.tick += 1
+        self.update()
 
     def set_working(self, working: bool) -> None:
+        if working != self.working:
+            self.tick = 0  # 食べ始めは必ずサイクルの頭から
         self.working = working
         self.update()
 
+    def _frame(self) -> tuple[list[str], int, Optional[int]]:
+        """
+        いまのコマを決める。
+
+        Returns:
+            (体のドット絵, 体の上下オフセット[ドット], ファイルのx座標[px] or None)
+        """
+        if not self.working:
+            breath = BREATH_PATTERN[(self.tick // 4) % len(BREATH_PATTERN)]
+            return SPRITE_IDLE, breath, None
+
+        step = self.tick % CHOMP_STEPS
+        px = self.PIXEL
+        start_x = self.WIDTH - len(SPRITE_FILE[0]) * px
+        end_x = self.BODY_W - 4 * px   # 口の奥
+
+        if step < CHOMP_SWALLOW_AT:
+            # 口を開けて待ち構え、ファイルが右から吸い込まれてくる
+            progress = step / (CHOMP_SWALLOW_AT - 1)
+            file_x = int(start_x + (end_x - start_x) * progress)
+            body = SPRITE_OPEN if step == 0 else SPRITE_WIDE
+            return body, 1, file_x
+        if step == CHOMP_SWALLOW_AT:
+            # 飲み込んだ瞬間。口を閉じて少し沈む
+            return SPRITE_IDLE, 0, None
+        # もぐもぐ
+        body = SPRITE_OPEN if step % 2 == 0 else SPRITE_IDLE
+        return body, 1 if step % 2 == 0 else 0, None
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # ドット絵はにじませない
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
-        import math
+        body, lift, file_x = self._frame()
+        px = self.PIXEL
+        body_y = (2 - lift) * px
 
-        glow = 1.0 + (0.18 * math.sin(self.phase) if self.working else 0.0)
-        center = self.SIZE / 2
+        # ファイルを先に描き、体をその上に重ねる。体の縁を越えた瞬間に
+        # 口の中へ消えていくように見える。
+        if file_x is not None:
+            file_y = body_y + 3 * px
+            _draw_sprite(painter, SPRITE_FILE, file_x, file_y, px)
 
-        # 体
-        gradient = QRadialGradient(center - 8, center - 10, self.SIZE * 0.8)
-        gradient.setColorAt(0.0, QColor(255, 224, 176).lighter(int(100 * glow)))
-        gradient.setColorAt(0.6, QColor(232, 152, 63))
-        gradient.setColorAt(1.0, QColor(170, 92, 26))
-        painter.setBrush(gradient)
-        painter.setPen(Qt.PenStyle.NoPen)
-
-        path = QPainterPath()
-        path.addEllipse(8, 10, self.SIZE - 16, self.SIZE - 20)
-        painter.drawPath(path)
-
-        # 目
-        painter.setBrush(QColor(58, 36, 17))
-        painter.drawEllipse(int(center - 16), int(center - 4), 7, 10)
-        painter.drawEllipse(int(center + 9), int(center - 4), 7, 10)
-
-        # ほお
-        painter.setBrush(QColor(200, 90, 60, 90))
-        painter.drawEllipse(int(center - 27), int(center + 8), 10, 6)
-        painter.drawEllipse(int(center + 17), int(center + 8), 10, 6)
+        _draw_sprite(painter, body, 0, body_y, px)
+        painter.end()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -800,25 +962,29 @@ class Kohaku:
     def _place_mascot(self) -> None:
         """画面左下に置く。タスクバーを避けるため作業領域を基準にする。"""
         screen = self.app.primaryScreen().availableGeometry()
-        self.mascot.move(screen.left() + 24, screen.bottom() - Mascot.SIZE - 16)
+        self.mascot.move(screen.left() + 24, screen.bottom() - Mascot.HEIGHT - 16)
 
     def panel_position(self) -> QPoint:
         """パネルはキャラの上に重ねて出す（キャラは隠れる）。"""
         screen = self.app.primaryScreen().availableGeometry()
         x = max(screen.left() + 12, self.mascot.x())
-        y = self.mascot.y() + Mascot.SIZE - self.panel.height()
+        y = self.mascot.y() + Mascot.HEIGHT - self.panel.height()
         y = max(screen.top() + 12, y)
         return QPoint(x, y)
 
     def toast_position(self) -> QPoint:
-        return QPoint(self.mascot.x() + Mascot.SIZE - 4, self.mascot.y() - 20)
+        # 体の右隣に出す（ファイルが飛んでくる余白の上に重ねる）
+        return QPoint(self.mascot.x() + Mascot.BODY_W + 8, self.mascot.y() - 24)
 
     def hide_toast(self) -> None:
         self.toast.hide()
 
     def _build_tray(self) -> QSystemTrayIcon:
         pixmap = QPixmap(32, 32)
-        pixmap.fill(QColor(232, 152, 63))
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        _draw_sprite(painter, SPRITE_IDLE, 0, 3, 2)
+        painter.end()
         tray = QSystemTrayIcon(QIcon(pixmap))
         tray.setToolTip("コハク")
 
@@ -903,7 +1069,8 @@ def run(watch_dir: str) -> int:
     """
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # パネルを閉じても常駐を続ける
-    app.setFont(QFont("Yu Gothic UI", 9))
+    _load_pixel_font()
+    app.setFont(QFont("DotGothic16", 10))
     app.setApplicationName("コハク")
 
     Kohaku(app, watch_dir)
