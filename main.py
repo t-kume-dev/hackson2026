@@ -5,18 +5,12 @@
 各チケットの中身には一切踏み込まない。
 
 現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
-           -> T4(classify_content) -> T5(resolve_category) -> (T6以降は未実装なのでprintのみ)
+           -> T4(classify_content) -> T5(resolve_category) -> T6(save_result)
 
-【T3の出力形式】常にdict。中身は filetype で判別する。
-- filetype が "text" / "pdf" の場合: {"filetype", "file_path", "content"}
-- filetype が "photo" の場合       : {"filetype", "file_path", "image_bytes", "mime_type"}
-
-【T4の出力形式】成功時 {"category", "subtags", "summary"} のdict、失敗時None
-
-【T5について】
-- 既存カテゴリ一覧はT5の get_category_names(db_path) がDB(categories.db)から直接読む
-- 最終的なカテゴリ名も T5の resolve_category(category, db_path) がDBを見て決定・登録する
-- DB_PATHはT6が管理する実際のDBファイルパスと合わせること
+【T5・T6のDB共有について】
+- T5(t5_dedupe.py)とT6(t6_filemanager.py)は、どちらも "categories.db" という
+  同じSQLiteファイルを見る（T5がcategoriesテーブル、T6がfiles/trash_logテーブルを担当）。
+- db.py は現状どちらからも使われていない（別ファイル omakase.db を指しているため）。
 """
 
 from __future__ import annotations
@@ -29,10 +23,12 @@ from t2_screening import screen_file
 from t3_content import extract_content
 from t4_classify import classify_content
 from t5_dedupe import get_category_names, resolve_category
+from t6_filemanager import save_result
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# categoriesテーブルを持つDBファイルのパス。T6が管理する実際のパスと合わせること。
+# categoriesテーブルを持つDBファイルのパス。t5_dedupe.py / t6_filemanager.py の
+# DB_PATHと必ず同じ値にすること。
 DB_PATH = "categories.db"
 
 
@@ -97,12 +93,28 @@ def main() -> None:
             # T4が提案したカテゴリ名を、T5で表記ゆれ統合・新規登録する
             final_category = resolve_category(t4_result["category"], db_path=DB_PATH)
 
-            # ここでT6(ファイル移動+DB保存)に渡すイメージ（今はprintのみ）
             print(
                 f"[T5] 最終カテゴリ確定: {new_file} "
                 f"(category={final_category}, subtags={t4_result['subtags']}, "
                 f"summary={t4_result['summary']}) -> T6へ渡す"
             )
+
+            # T5で確定した最終カテゴリを反映したclassificationをT6に渡す
+            classification = {
+                "category": final_category,
+                "subtags": t4_result["subtags"],
+                "summary": t4_result["summary"],
+            }
+
+            t6_result = save_result(new_file, classification)
+
+            if t6_result["db_saved"]:
+                print(f"[T6] 保存完了: {t6_result['moved_path']}")
+            else:
+                print(
+                    f"[T6] 保存に失敗しました（ファイルは移動済みの可能性あり）: "
+                    f"{t6_result['moved_path']}"
+                )
     except KeyboardInterrupt:
         print("\n[T1] 監視を終了しました")
 
