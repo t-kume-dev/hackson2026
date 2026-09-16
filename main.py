@@ -5,7 +5,7 @@
 各チケットの中身には一切踏み込まない。
 
 現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
-           -> T4(classify_content) -> (T5以降は未実装なのでprintのみ)
+           -> T4(classify_content) -> T5(resolve_category) -> (T6以降は未実装なのでprintのみ)
 
 【T3の出力形式】常にdict。中身は filetype で判別する。
 - filetype が "text" / "pdf" の場合: {"filetype", "file_path", "content"}
@@ -13,8 +13,10 @@
 
 【T4の出力形式】成功時 {"category", "subtags", "summary"} のdict、失敗時None
 
-既存カテゴリ一覧は本来T5(カテゴリ重複防止)がDBを見て管理する想定だが、
-T5が未実装のため暫定的に空リストを渡している。
+【T5について】
+- 既存カテゴリ一覧はT5の get_category_names(db_path) がDB(categories.db)から直接読む
+- 最終的なカテゴリ名も T5の resolve_category(category, db_path) がDBを見て決定・登録する
+- DB_PATHはT6が管理する実際のDBファイルパスと合わせること
 """
 
 from __future__ import annotations
@@ -26,11 +28,12 @@ from t1_watch import watch_folder
 from t2_screening import screen_file
 from t3_content import extract_content
 from t4_classify import classify_content
+from t5_dedupe import get_category_names, resolve_category
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# T5未実装のための暫定値。T5ができたら「DBから既存カテゴリ一覧を取得する処理」に差し替える。
-EXISTING_CATEGORIES: list[str] = []
+# categoriesテーブルを持つDBファイルのパス。T6が管理する実際のパスと合わせること。
+DB_PATH = "categories.db"
 
 
 def main() -> None:
@@ -74,19 +77,31 @@ def main() -> None:
                     f"(先頭100文字: {preview}...) -> T4へテキスト入力として渡す"
                 )
 
+            # T5のDBから既存カテゴリ一覧を取得し、T4のプロンプトに渡す
+            existing_categories = get_category_names(DB_PATH)
+
             # T3の出力をそのままT4に渡す
-            t4_result = classify_content(t3_result, EXISTING_CATEGORIES)
+            t4_result = classify_content(t3_result, existing_categories)
 
             if t4_result is None:
                 # T4で分類失敗したので後続処理には渡さない
                 print(f"[T4] 分類失敗のためスキップ: {new_file}")
                 continue
 
-            # ここでT5(カテゴリ重複防止)に渡すイメージ（今はprintのみ）
             print(
                 f"[T4] 分類完了: {new_file} "
                 f"(category={t4_result['category']}, subtags={t4_result['subtags']}) "
                 f"-> T5へ渡す"
+            )
+
+            # T4が提案したカテゴリ名を、T5で表記ゆれ統合・新規登録する
+            final_category = resolve_category(t4_result["category"], db_path=DB_PATH)
+
+            # ここでT6(ファイル移動+DB保存)に渡すイメージ（今はprintのみ）
+            print(
+                f"[T5] 最終カテゴリ確定: {new_file} "
+                f"(category={final_category}, subtags={t4_result['subtags']}, "
+                f"summary={t4_result['summary']}) -> T6へ渡す"
             )
     except KeyboardInterrupt:
         print("\n[T1] 監視を終了しました")
