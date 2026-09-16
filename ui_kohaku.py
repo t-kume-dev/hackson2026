@@ -838,24 +838,31 @@ class Kohaku:
         logger.info(f"[UI] 処理されなかったファイル: {path}")
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+def run(watch_dir: str) -> int:
+    """
+    GUIを起動して常駐する。アプリの入口は main.py なので、通常はそちらから呼ばれる。
 
-    watch_dir = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / "Downloads")
-    if not Path(watch_dir).is_dir():
-        print(f"監視対象のフォルダが見つかりません: {watch_dir}")
-        sys.exit(1)
-
+    Returns:
+        Qtの終了コード
+    """
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # パネルを閉じても常駐を続ける
     app.setFont(QFont("Yu Gothic UI", 9))
+    app.setApplicationName("コハク")
 
-    kohaku = Kohaku(app, watch_dir)
+    Kohaku(app, watch_dir)
+
     print(f"[コハク] 監視開始: {watch_dir}")
     print("[コハク] 左下のキャラをクリックすると話せます。終了はキャラを右クリック。")
 
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    # 単体で動かしたいとき用。通常は main.py から起動する。
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    target = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / "Downloads")
+    if not Path(target).is_dir():
+        print(f"監視対象のフォルダが見つかりません: {target}")
+        sys.exit(1)
+    sys.exit(run(target))

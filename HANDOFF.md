@@ -94,13 +94,17 @@ importすら通りません。** PySide6はQt公式の署名付きバイナリ�
 APIはほぼ同じで、違いはシグナル定義が `pyqtSignal` ではなく `Signal` になる点だけです。
 PyQt6に戻さないこと。
 
-起動:
+起動（入口は main.py ひとつ）:
 
 ```bash
-python ui_kohaku.py <監視対象フォルダ>   # 省略時は ~/Downloads
+python main.py                      # ~/Downloads を監視してUI起動
+python main.py <フォルダ>            # 監視対象を指定してUI起動
+python main.py <フォルダ> --console  # UIなし。配線のデバッグ用
 ```
 
+`python main.py` はウィンドウを出さず、デスクトップ左下にキャラだけを常駐させます。
 左下のキャラをクリックで会話、右クリックで終了。タスクトレイにも常駐します。
+`ui_kohaku.py` を直接叩いても動きますが、通常の入口は main.py です。
 
 ## 3. DB構成（ここは最近大きく変えたので必読）
 

@@ -1,41 +1,38 @@
 """
-配線担当（SM）が書く部分（コンソール版）。
+おまかせ整理Bot の入口。
 
-T1〜T6の受け渡しそのものは pipeline.process_file() に切り出してある。
-GUI版（ui_kohaku.py）も同じ関数を呼ぶので、順序を変えるときは pipeline.py を直すこと。
-ここに残っているのは「監視ループを回して結果を標準出力に出す」部分だけ。
+    python main.py                   # ダウンロードフォルダを監視してUIを起動
+    python main.py <フォルダ>         # 監視対象を指定してUIを起動
+    python main.py <フォルダ> --console  # UIなし。ログだけ流すコンソール版
 
-デモや常駐で使うのはGUI版:
-    python ui_kohaku.py <監視対象フォルダ>
+既定ではネイティブアプリとして起動し、デスクトップ左下に常駐キャラ（コハク）が出る。
+ウィンドウは出ない。キャラをクリックすると会話パネルが開き、自然文でファイルを探せる。
 
-【DBについて】
-- SQLiteへのアクセスは全て db.py に集約されている（T5がcategoriesテーブル、
-  T6がfiles/trash_logテーブル、T7が検索とlast_accessed_atを担当）。
-  DBファイルのパスは db.DB_PATH ただ1つが正。
+【全体の構成】
+- T1〜T6の受け渡しは pipeline.process_file() にまとまっている。
+  UI版もコンソール版も同じ関数を呼ぶので、処理順を変えるときは pipeline.py を直す。
+- UIの組み立ては ui_kohaku.py。ここでは起動方法を決めるだけで、UIの中身は持たない。
+- SQLiteへのアクセスは全て db.py に集約されている。DBのパスは db.DB_PATH ただ1つが正。
+
+--console は配線の確認・デバッグ用に残してある。GUIを起動せずに
+「検出 → 分類 → 移動 → DB保存」の各段がどこで止まったかを見たいとき用。
 """
 
 from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 import db
 from pipeline import process_file
 from t1_watch import watch_folder
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+DEFAULT_WATCH_DIR = Path.home() / "Downloads"
 
 
-def main() -> None:
-    if len(sys.argv) < 2:
-        print("使い方: python main.py <監視対象フォルダのパス>")
-        sys.exit(1)
-
-    # テーブルが無ければここで作る（何度呼んでも安全）
-    db.init_db()
-    print(f"[DB] 使用するDB: {db.DB_PATH}")
-
-    watch_dir = sys.argv[1]
+def run_console(watch_dir: str) -> None:
+    """UIを使わず、標準出力にパイプラインの進行を書き出す。"""
     print(f"[T1] 監視開始: {watch_dir}")
     print("(Ctrl+Cで終了)")
 
@@ -54,6 +51,34 @@ def main() -> None:
             print(f"     要約: {result['summary']}")
     except KeyboardInterrupt:
         print("\n[T1] 監視を終了しました")
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    args = [a for a in sys.argv[1:] if a != "--console"]
+    console = "--console" in sys.argv
+
+    watch_dir = Path(args[0]) if args else DEFAULT_WATCH_DIR
+
+    if not watch_dir.is_dir():
+        print(f"監視対象のフォルダが見つかりません: {watch_dir}")
+        print("使い方: python main.py [監視するフォルダ] [--console]")
+        sys.exit(1)
+
+    # テーブルが無ければここで作る（何度呼んでも安全）
+    db.init_db()
+    print(f"[DB] 使用するDB: {db.DB_PATH}")
+
+    if console:
+        run_console(str(watch_dir))
+        return
+
+    # UIの読み込みはここまで遅らせる。--console しか使わない環境に
+    # PySide6が入っていなくても、コンソール版は動かせるようにするため。
+    from ui_kohaku import run
+
+    sys.exit(run(str(watch_dir)))
 
 
 if __name__ == "__main__":
