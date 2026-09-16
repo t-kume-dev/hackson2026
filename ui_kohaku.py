@@ -129,23 +129,6 @@ class SearchThread(QThread):
             self.done.emit(None)
 
 
-class SimilarThread(QThread):
-    """「似たファイル」の計算。embedding同士の内積なので速いが一応スレッドで。"""
-
-    done = Signal(object)
-
-    def __init__(self, file_id: int) -> None:
-        super().__init__()
-        self.file_id = file_id
-
-    def run(self) -> None:
-        try:
-            self.done.emit(t7.find_similar(self.file_id))
-        except Exception as e:
-            logger.exception(f"[UI] 類似検索に失敗しました: {e}")
-            self.done.emit([])
-
-
 # ---------------------------------------------------------------------------
 # 部品
 # ---------------------------------------------------------------------------
@@ -200,7 +183,7 @@ class Bubble(QFrame):
 
 
 class FileCard(QFrame):
-    """検索結果1件。開く / 似たファイル / 場所を表示。"""
+    """ファイル1件のカード。開く / 別のカテゴリへ / 場所を表示。"""
 
     def __init__(self, file: dict, panel: "ChatPanel") -> None:
         super().__init__()
@@ -249,9 +232,13 @@ class FileCard(QFrame):
         open_btn = _button("開く", "primary")
         open_btn.clicked.connect(self._open)
         actions.addWidget(open_btn)
-        similar_btn = _button("似たファイル")
-        similar_btn.clicked.connect(lambda: panel.show_similar(file))
-        actions.addWidget(similar_btn)
+        # 分類の訂正はカードからも触れるようにしておく。
+        # 通知の吹き出しは5秒で消えるので、そこにしか入口が無いと訂正できない。
+        recat_btn = _button("別のカテゴリへ")
+        recat_btn.clicked.connect(
+            lambda: panel.offer_recategorize(file["id"], file["category"])
+        )
+        actions.addWidget(recat_btn)
         reveal_btn = _button("場所を表示")
         reveal_btn.clicked.connect(lambda: t7.reveal_file(file))
         actions.addWidget(reveal_btn)
@@ -475,20 +462,6 @@ class ChatPanel(QWidget):
             head += f"<br><span style='color:{AMBER};'>{' / '.join(result.filters)}</span> で絞り込んでいます。"
         self.say(head)
         self.add_cards([hit.file for hit in result.hits])
-
-    def show_similar(self, file: dict) -> None:
-        self.say(f"「{file['filename']}」に似たファイルだね。")
-        thread = SimilarThread(file["id"])
-        thread.done.connect(self._show_similar_result)
-        thread.finished.connect(lambda: self.threads.remove(thread))
-        self.threads.append(thread)
-        thread.start()
-
-    def _show_similar_result(self, hits) -> None:
-        if not hits:
-            self.say("似ているものは見つからなかった。")
-            return
-        self.add_cards([hit.file for hit in hits])
 
     # --- 分類の訂正 ---------------------------------------------------------
 

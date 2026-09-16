@@ -242,10 +242,13 @@ def search(
 
 def find_similar(file_id: int, limit: int = 2) -> list[SearchHit]:
     """
-    指定ファイルに似たファイルを返す（「これに似たファイル」ボタン用）。
+    指定ファイルに似たファイルを返す。
 
     files.embedding 同士を直接比較するだけなので、embeddingの作り直しは不要。
     エクスプローラーには原理的にできない操作で、同じ講義の別の回などが芋づるで出る。
+
+    【現在UIからは呼ばれていない】結果カードのボタンは「開く / 別のカテゴリへ /
+    場所を表示」の3つに絞ったため。復活させたくなったときのために関数は残してある。
     """
     files = db.get_active_files()
     target = next((f for f in files if f["id"] == file_id), None)
