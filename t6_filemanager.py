@@ -119,7 +119,7 @@ def build_index_text(category: str, subtags: list[str], summary: str) -> str:
 def _encode(text: str) -> np.ndarray:
     """L2正規化済みのembeddingを返す（コサイン類似度を内積で計算できるようにする）"""
     model = _get_embedding_model()
-    embedding = model.encode(text, normalize_embeddings=True)
+    embedding = model.encode(text, normalize_embeddings=True, show_progress_bar=False)
     return np.asarray(embedding, dtype=np.float32)
 
 
@@ -152,7 +152,7 @@ def save_result(file_path: str, classification: dict) -> dict:
 
     if not source.exists():
         logger.error(f"[T6] ファイルが存在しません: {file_path}")
-        return {"moved_path": file_path, "db_saved": False}
+        return {"moved_path": file_path, "db_saved": False, "file_id": None}
 
     category = classification.get("category")
     subtags = classification.get("subtags", [])
@@ -160,7 +160,7 @@ def save_result(file_path: str, classification: dict) -> dict:
 
     if not category:
         logger.error(f"[T6] categoryがありません: {classification}")
-        return {"moved_path": file_path, "db_saved": False}
+        return {"moved_path": file_path, "db_saved": False, "file_id": None}
 
     original_path = str(source)
     filetype = _guess_filetype(file_path)
@@ -171,13 +171,13 @@ def save_result(file_path: str, classification: dict) -> dict:
         embedding = _create_embedding(category, subtags, summary)
     except Exception as e:
         logger.error(f"[T6] embedding生成に失敗しました: {e}")
-        return {"moved_path": file_path, "db_saved": False}
+        return {"moved_path": file_path, "db_saved": False, "file_id": None}
 
     try:
         moved_path = _move_to_category_folder(source, category)
     except OSError as e:
         logger.error(f"[T6] ファイル移動に失敗しました: {e}")
-        return {"moved_path": file_path, "db_saved": False}
+        return {"moved_path": file_path, "db_saved": False, "file_id": None}
 
     # filesへのINSERTとtrash_logへのINSERTは1つのトランザクションにまとめる
     # （片方だけ残ってUndoできなくなるのを防ぐ）
@@ -206,10 +206,53 @@ def save_result(file_path: str, classification: dict) -> dict:
             conn.close()
     except sqlite3.Error as e:
         logger.error(f"[T6] DB保存に失敗しました: {e}")
-        return {"moved_path": str(moved_path), "db_saved": False}
+        return {"moved_path": str(moved_path), "db_saved": False, "file_id": None}
 
     logger.info(f"[T6] 保存完了: {original_path} -> {moved_path}")
-    return {"moved_path": str(moved_path), "db_saved": True}
+    return {"moved_path": str(moved_path), "db_saved": True, "file_id": file_id}
+
+
+def recategorize(file_id: int, new_category: str) -> Optional[str]:
+    """
+    AIの分類をユーザーが訂正したときに、別カテゴリのフォルダへ移し直す。
+
+    分類は必ず外れるので、手で直せる逃げ道がないとその場で詰む。
+    移動前のパスは trash_log に残すので、Undoの対象にもなる。
+
+    Returns:
+        移動後のパス。失敗した場合はNone。
+    """
+    record = db.get_file(file_id)
+    if record is None:
+        logger.error(f"[T6] ファイルが見つかりません: id={file_id}")
+        return None
+
+    source = Path(record["path"])
+    if not source.exists():
+        logger.error(f"[T6] 実ファイルがありません: {source}")
+        return None
+
+    original_path = str(source)
+
+    try:
+        moved_path = _move_to_category_folder(source, new_category)
+    except OSError as e:
+        logger.error(f"[T6] 移動に失敗しました: {e}")
+        return None
+
+    try:
+        db.update_file_location(file_id, str(moved_path), new_category)
+        db.insert_trash_log(
+            file_id=file_id,
+            original_path=original_path,
+            action_type="move",
+        )
+    except sqlite3.Error as e:
+        logger.error(f"[T6] 訂正のDB更新に失敗しました: {e}")
+        return None
+
+    logger.info(f"[T6] カテゴリを訂正: {original_path} -> {moved_path}")
+    return str(moved_path)
 
 
 if __name__ == "__main__":

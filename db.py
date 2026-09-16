@@ -12,6 +12,8 @@ SQLite DB層（T5・T6・T7以降が共通で使う「外側の箱」）
 - get_category_names() / get_category_embeddings()
   / insert_category() / update_category_embedding()  : T5（カテゴリ重複防止）が使う
 - insert_file() / insert_trash_log()                 : T6（ファイル移動＋DB保存）が使う
+- get_active_files() / get_file() / touch_file()
+  / update_file_location() / set_file_status()       : T7（意味検索・ファイル操作）が使う
 
 embeddingはnumpy配列（float32）としてやり取りし、DBにはBLOBとして保存する。
 categories.embedding だけはNULLを許容する（T5がembedding API呼び出しに失敗したとき、
@@ -264,6 +266,110 @@ def insert_trash_log(
     finally:
         if owns_conn:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# T7: 意味検索・ファイル操作
+# ---------------------------------------------------------------------------
+
+def _row_to_file(row: sqlite3.Row) -> dict:
+    """filesテーブルの1行を扱いやすいdictに変換する（embeddingはnumpy配列に復元）。"""
+    return {
+        "id": row["id"],
+        "path": row["path"],
+        "filename": row["filename"],
+        "filetype": row["filetype"],
+        "category": row["category"],
+        "subtags": json.loads(row["subtags"]) if row["subtags"] else [],
+        "summary": row["summary"],
+        "embedding": from_blob(row["embedding"]),
+        "hash": row["hash"],
+        "file_size": row["file_size"],
+        "created_at": row["created_at"],
+        "last_accessed_at": row["last_accessed_at"],
+        "status": row["status"],
+    }
+
+
+def get_active_files(db_path: Optional[Union[str, Path]] = None) -> list[dict]:
+    """
+    status='active' のファイルを全件返す（T7の意味検索・T8の放置判定が使う）。
+
+    件数が数千を超えるまでは全件をメモリに載せて総当たりで十分速い。
+    近似最近傍インデックスが必要になったらここを差し替える。
+    """
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM files WHERE status = 'active' ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_file(row) for row in rows]
+
+
+def get_file(file_id: int, db_path: Optional[Union[str, Path]] = None) -> Optional[dict]:
+    """idで1件取得する。見つからなければNone。"""
+    conn = get_connection(db_path)
+    try:
+        row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    finally:
+        conn.close()
+    return _row_to_file(row) if row is not None else None
+
+
+def touch_file(file_id: int, db_path: Optional[Union[str, Path]] = None) -> None:
+    """
+    last_accessed_at を現在時刻で更新する。アプリ経由でファイルを開いた瞬間に呼ぶ。
+
+    OSのatimeは設定次第で更新されず信頼できないため、放置ファイル検出（T8）の
+    「未アクセス期間」はこの記録を一次情報として使う。
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE files SET last_accessed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_file_location(
+    file_id: int,
+    new_path: str,
+    new_category: str,
+    db_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """
+    分類をユーザーが訂正したときに、保存先とカテゴリを更新する。
+
+    実ファイルの移動は呼び出し側（T6）の責任。ここはDBの整合を取るだけ。
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE files SET path = ?, filename = ?, category = ? WHERE id = ?",
+            (new_path, Path(new_path).name, new_category, file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_file_status(
+    file_id: int,
+    status: str,
+    db_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """status を 'active' / 'trashed' の間で切り替える（T9のゴミ箱・Undo用）。"""
+    conn = get_connection(db_path)
+    try:
+        conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -1,16 +1,17 @@
 """
-配線担当（SM）が書く部分。
+配線担当（SM）が書く部分（コンソール版）。
 
-「前のチケットの出力を次のチケットに渡す」処理だけをここに書く。
-各チケットの中身には一切踏み込まない。
+T1〜T6の受け渡しそのものは pipeline.process_file() に切り出してある。
+GUI版（ui_kohaku.py）も同じ関数を呼ぶので、順序を変えるときは pipeline.py を直すこと。
+ここに残っているのは「監視ループを回して結果を標準出力に出す」部分だけ。
 
-現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
-           -> T4(classify_content) -> T5(resolve_category) -> T6(save_result)
+デモや常駐で使うのはGUI版:
+    python ui_kohaku.py <監視対象フォルダ>
 
 【DBについて】
 - SQLiteへのアクセスは全て db.py に集約されている（T5がcategoriesテーブル、
-  T6がfiles/trash_logテーブルを担当）。DBファイルのパスは db.DB_PATH ただ1つが正。
-- ここでは起動時に db.init_db() を呼んでテーブルを用意するだけでよい。
+  T6がfiles/trash_logテーブル、T7が検索とlast_accessed_atを担当）。
+  DBファイルのパスは db.DB_PATH ただ1つが正。
 """
 
 from __future__ import annotations
@@ -19,14 +20,10 @@ import logging
 import sys
 
 import db
+from pipeline import process_file
 from t1_watch import watch_folder
-from t2_screening import screen_file
-from t3_content import extract_content
-from t4_classify import classify_content
-from t5_dedupe import get_category_names, resolve_category
-from t6_filemanager import save_result
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def main() -> None:
@@ -44,78 +41,17 @@ def main() -> None:
 
     try:
         for new_file in watch_folder(watch_dir):
-            # T1の出力をそのままT2に渡す
-            file_type = screen_file(new_file)
+            print(f"[T1] 検出: {new_file}")
 
-            if file_type is None:
-                # T2で除外されたので後続処理には渡さない
+            result = process_file(new_file, on_progress=lambda m: print(f"  ... {m}"))
+
+            if result is None:
+                print(f"[--] 処理されませんでした: {new_file}")
                 continue
 
-            print(f"[T2] 処理対象と判定: {new_file} (種別: {file_type}) -> T3へ渡す")
-
-            # T2の出力（ファイルパス＋種別）をそのままT3に渡す
-            t3_result = extract_content(new_file, file_type)
-
-            if t3_result is None:
-                # T3で抽出失敗/無効だったので後続処理には渡さない
-                print(f"[T3] コンテンツ抽出失敗のためスキップ: {new_file}")
-                continue
-
-            if t3_result["filetype"] == "photo":
-                size_kb = len(t3_result["image_bytes"]) / 1024
-                print(
-                    f"[T3] 画像を読み込み完了: {t3_result['file_path']} "
-                    f"({t3_result['mime_type']}, {size_kb:.1f}KB) -> T4へ画像入力として渡す"
-                )
-            else:
-                preview = t3_result["content"][:100].replace("\n", " ")
-                print(
-                    f"[T3] コンテンツ抽出完了: {t3_result['file_path']} "
-                    f"(先頭100文字: {preview}...) -> T4へテキスト入力として渡す"
-                )
-
-            # T5のDBから既存カテゴリ一覧を取得し、T4のプロンプトに渡す
-            existing_categories = get_category_names()
-
-            # T3の出力をそのままT4に渡す
-            t4_result = classify_content(t3_result, existing_categories)
-
-            if t4_result is None:
-                # T4で分類失敗したので後続処理には渡さない
-                print(f"[T4] 分類失敗のためスキップ: {new_file}")
-                continue
-
-            print(
-                f"[T4] 分類完了: {new_file} "
-                f"(category={t4_result['category']}, subtags={t4_result['subtags']}) "
-                f"-> T5へ渡す"
-            )
-
-            # T4が提案したカテゴリ名を、T5で表記ゆれ統合・新規登録する
-            final_category = resolve_category(t4_result["category"])
-
-            print(
-                f"[T5] 最終カテゴリ確定: {new_file} "
-                f"(category={final_category}, subtags={t4_result['subtags']}, "
-                f"summary={t4_result['summary']}) -> T6へ渡す"
-            )
-
-            # T5で確定した最終カテゴリを反映したclassificationをT6に渡す
-            classification = {
-                "category": final_category,
-                "subtags": t4_result["subtags"],
-                "summary": t4_result["summary"],
-            }
-
-            t6_result = save_result(new_file, classification)
-
-            if t6_result["db_saved"]:
-                print(f"[T6] 保存完了: {t6_result['moved_path']}")
-            else:
-                print(
-                    f"[T6] 保存に失敗しました（ファイルは移動済みの可能性あり）: "
-                    f"{t6_result['moved_path']}"
-                )
+            print(f"[T6] 保存完了: {result['moved_path']}")
+            print(f"     カテゴリ: {result['category']} / タグ: {result['subtags']}")
+            print(f"     要約: {result['summary']}")
     except KeyboardInterrupt:
         print("\n[T1] 監視を終了しました")
 
