@@ -269,6 +269,41 @@ def find_similar(file_id: int, limit: int = 2) -> list[SearchHit]:
     return hits[:limit]
 
 
+def suggest_categories(file_id: int, limit: int = 3) -> list[str]:
+    """
+    分類を訂正するときの入れ直し先候補を、確からしい順に返す。
+
+    カテゴリ名を新たにembedding化するのではなく、同じカテゴリに入っている
+    既存ファイルのembeddingと比べて、最も近いカテゴリを拾う。
+    numpyの内積だけで済むのでモデル呼び出しが要らず、UIを待たせない。
+
+    まだ他にファイルが無いカテゴリは比較材料が無いので、末尾に新しい順で足す。
+    """
+    files = db.get_active_files()
+    target = next((f for f in files if f["id"] == file_id), None)
+    if target is None:
+        return []
+
+    best: dict[str, float] = {}
+    for file in files:
+        if file["id"] == file_id or file["category"] == target["category"]:
+            continue
+        if file["embedding"] is None or file["embedding"].shape != target["embedding"].shape:
+            continue
+        score = float(np.dot(target["embedding"], file["embedding"]))
+        if score > best.get(file["category"], -1.0):
+            best[file["category"]] = score
+
+    ranked = [name for name, _ in sorted(best.items(), key=lambda kv: kv[1], reverse=True)]
+
+    # 比較材料が無かったカテゴリ（まだ1件も入っていない等）も候補には残す
+    for name in db.get_category_names():
+        if name != target["category"] and name not in ranked:
+            ranked.append(name)
+
+    return ranked[:limit]
+
+
 def open_file(file: dict) -> bool:
     """
     ファイルをOSの既定アプリで開く（エクスプローラーでダブルクリックしたのと同じ挙動）。

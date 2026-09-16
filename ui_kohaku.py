@@ -21,8 +21,8 @@ PyQt6のDLLがブロックされてimportすら通らない。PySide6はQt公式
 Signal になる点だけ違う。
 
 起動:
-    python ui_kohaku.py <監視対象フォルダ>
-    （省略時は ~/Downloads を監視する）
+    python main.py <監視対象フォルダ>
+    （アプリの入口は main.py。このファイルを直接叩いても動くが通常はそちら）
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -491,25 +492,48 @@ class ChatPanel(QWidget):
 
     # --- 分類の訂正 ---------------------------------------------------------
 
+    NEW_CATEGORY = "新しく作る"
+
     def offer_recategorize(self, file_id: int, current_category: str) -> None:
         """
         通知の「違うカテゴリ」から呼ばれる。
         AIの分類は必ず外れるので、その場で入れ直せる逃げ道を用意しておく。
+
+        候補は「同じ内容のファイルが既に入っているカテゴリ」を近い順に並べる。
+        当てはまるものが無いこともあるので、必ず「新しく作る」を最後に足す。
         """
         self.show_panel()
-        self.say("どこに入れ直す？")
-        candidates = [c for c in db.get_category_names() if c != current_category][:3]
-        if not candidates:
-            self.say("まだ他のカテゴリがないみたい。")
-            return
-        self.add_chips(candidates, lambda name: self._do_recategorize(file_id, name))
+        self.say(f"いまは「{current_category}」に入れてあるよ。<br>どこに入れ直す？")
 
-    def _do_recategorize(self, file_id: int, category: str) -> None:
+        candidates = t7.suggest_categories(file_id)
+        self.add_chips(
+            candidates + [self.NEW_CATEGORY],
+            lambda name: self._pick_category(file_id, name),
+        )
+
+    def _pick_category(self, file_id: int, category: str) -> None:
+        if category == self.NEW_CATEGORY:
+            name, ok = QInputDialog.getText(self, "新しいカテゴリ", "カテゴリ名を入れてください")
+            name = name.strip() if ok else ""
+            if not name:
+                self.say("そのままにしておくね。")
+                return
+            category = name
+
         moved = t6.recategorize(file_id, category)
-        if moved:
-            self.say(f"「{category}」に移したよ。")
-        else:
+        if not moved:
             self.say("移せなかった。ファイルが見当たらない。")
+            return
+
+        # 新しいカテゴリは categories テーブルにも登録しておく。
+        # ここを忘れると、次の分類でT4のプロンプトに候補として出てこない。
+        if category not in db.get_category_names():
+            db.insert_category(category)
+
+        self.say(f"「{category}」に移したよ。")
+        file = db.get_file(file_id)
+        if file is not None:
+            self.add_cards([file])
 
     # --- 表示制御 -----------------------------------------------------------
 
