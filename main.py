@@ -4,11 +4,17 @@
 「前のチケットの出力を次のチケットに渡す」処理だけをここに書く。
 各チケットの中身には一切踏み込まない。
 
-現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content) -> (T4以降は未実装なのでprintのみ)
+現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
+           -> T4(classify_content) -> (T5以降は未実装なのでprintのみ)
 
 【T3の出力形式】常にdict。中身は filetype で判別する。
 - filetype が "text" / "pdf" の場合: {"filetype", "file_path", "content"}
 - filetype が "photo" の場合       : {"filetype", "file_path", "image_bytes", "mime_type"}
+
+【T4の出力形式】成功時 {"category", "subtags", "summary"} のdict、失敗時None
+
+既存カテゴリ一覧は本来T5(カテゴリ重複防止)がDBを見て管理する想定だが、
+T5が未実装のため暫定的に空リストを渡している。
 """
 
 from __future__ import annotations
@@ -19,8 +25,12 @@ import sys
 from t1_watch import watch_folder
 from t2_screening import screen_file
 from t3_content import extract_content
+from t4_classify import classify_content
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# T5未実装のための暫定値。T5ができたら「DBから既存カテゴリ一覧を取得する処理」に差し替える。
+EXISTING_CATEGORIES: list[str] = []
 
 
 def main() -> None:
@@ -51,7 +61,6 @@ def main() -> None:
                 print(f"[T3] コンテンツ抽出失敗のためスキップ: {new_file}")
                 continue
 
-            # T3の出力をそのままT4に渡すイメージ（今はprintのみ）
             if t3_result["filetype"] == "photo":
                 size_kb = len(t3_result["image_bytes"]) / 1024
                 print(
@@ -64,6 +73,21 @@ def main() -> None:
                     f"[T3] コンテンツ抽出完了: {t3_result['file_path']} "
                     f"(先頭100文字: {preview}...) -> T4へテキスト入力として渡す"
                 )
+
+            # T3の出力をそのままT4に渡す
+            t4_result = classify_content(t3_result, EXISTING_CATEGORIES)
+
+            if t4_result is None:
+                # T4で分類失敗したので後続処理には渡さない
+                print(f"[T4] 分類失敗のためスキップ: {new_file}")
+                continue
+
+            # ここでT5(カテゴリ重複防止)に渡すイメージ（今はprintのみ）
+            print(
+                f"[T4] 分類完了: {new_file} "
+                f"(category={t4_result['category']}, subtags={t4_result['subtags']}) "
+                f"-> T5へ渡す"
+            )
     except KeyboardInterrupt:
         print("\n[T1] 監視を終了しました")
 
