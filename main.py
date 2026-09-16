@@ -1,91 +1,122 @@
 """
-T6単体テスト
+配線担当（SM）が書く部分。
 
-T1〜T4は使わず、T4から渡ってくる想定の分類結果を
-仮データとしてT6に直接渡す。
+「前のチケットの出力を次のチケットに渡す」処理だけをここに書く。
+各チケットの中身には一切踏み込まない。
+
+現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
+           -> T4(classify_content) -> T5(resolve_category) -> T6(save_result)
+
+【T5・T6のDB共有について】
+- T5(t5_dedupe.py)とT6(t6_filemanager.py)は、どちらも "categories.db" という
+  同じSQLiteファイルを見る（T5がcategoriesテーブル、T6がfiles/trash_logテーブルを担当）。
+- db.py は現状どちらからも使われていない（別ファイル omakase.db を指しているため）。
 """
 
-from pathlib import Path
+from __future__ import annotations
 
-from db import init_db
+import logging
+import sys
+
+from t1_watch import watch_folder
+from t2_screening import screen_file
+from t3_content import extract_content
+from t4_classify import classify_content
+from t5_dedupe import get_category_names, resolve_category
 from t6_filemanager import save_result
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# categoriesテーブルを持つDBファイルのパス。t5_dedupe.py / t6_filemanager.py の
+# DB_PATHと必ず同じ値にすること。
+DB_PATH = "categories.db"
 
 
 def main() -> None:
-    # =========================
-    # DBを初期化
-    # =========================
+    if len(sys.argv) < 2:
+        print("使い方: python main.py <監視対象フォルダのパス>")
+        sys.exit(1)
 
-    init_db()
+    watch_dir = sys.argv[1]
+    print(f"[T1] 監視開始: {watch_dir}")
+    print("(Ctrl+Cで終了)")
 
-    # =========================
-    # T6用の仮ファイルを作成
-    # =========================
+    try:
+        for new_file in watch_folder(watch_dir):
+            # T1の出力をそのままT2に渡す
+            file_type = screen_file(new_file)
 
-    test_file = Path("t6_test.txt")
+            if file_type is None:
+                # T2で除外されたので後続処理には渡さない
+                continue
 
-    test_file.write_text(
-        """社内プロジェクトの会議メモ
+            print(f"[T2] 処理対象と判定: {new_file} (種別: {file_type}) -> T3へ渡す")
 
-プロジェクト名：おまかせ整理Bot
+            # T2の出力（ファイルパス＋種別）をそのままT3に渡す
+            t3_result = extract_content(new_file, file_type)
 
-本日の打ち合わせ内容：
-・ファイル自動整理機能について確認
-・Gemini APIを利用したファイル分類を実装
-・分類されたファイルをカテゴリごとのフォルダーへ移動
-・SQLiteデータベースにファイル情報を保存
-・今後は意味検索機能を追加する予定
+            if t3_result is None:
+                # T3で抽出失敗/無効だったので後続処理には渡さない
+                print(f"[T3] コンテンツ抽出失敗のためスキップ: {new_file}")
+                continue
 
-次回までのタスク：
-・T6のファイル移動処理を確認する
-・データベースへの保存結果を確認する
-""",
-        encoding="utf-8",
-    )
+            if t3_result["filetype"] == "photo":
+                size_kb = len(t3_result["image_bytes"]) / 1024
+                print(
+                    f"[T3] 画像を読み込み完了: {t3_result['file_path']} "
+                    f"({t3_result['mime_type']}, {size_kb:.1f}KB) -> T4へ画像入力として渡す"
+                )
+            else:
+                preview = t3_result["content"][:100].replace("\n", " ")
+                print(
+                    f"[T3] コンテンツ抽出完了: {t3_result['file_path']} "
+                    f"(先頭100文字: {preview}...) -> T4へテキスト入力として渡す"
+                )
 
-    print("=== T6単体テスト開始 ===")
-    print(f"テストファイル: {test_file}")
+            # T5のDBから既存カテゴリ一覧を取得し、T4のプロンプトに渡す
+            existing_categories = get_category_names(DB_PATH)
 
-    # =========================
-    # T4から渡ってくる想定の仮データ
-    # =========================
+            # T3の出力をそのままT4に渡す
+            t4_result = classify_content(t3_result, existing_categories)
 
-    classification = {
-        "category": "プロジェクト",
-        "subtags": [
-            "会議",
-            "開発",
-            "ファイル整理",
-        ],
-        "summary": "おまかせ整理Botの開発に関する会議メモ",
-    }
+            if t4_result is None:
+                # T4で分類失敗したので後続処理には渡さない
+                print(f"[T4] 分類失敗のためスキップ: {new_file}")
+                continue
 
-    print("仮の分類結果:")
-    print(classification)
+            print(
+                f"[T4] 分類完了: {new_file} "
+                f"(category={t4_result['category']}, subtags={t4_result['subtags']}) "
+                f"-> T5へ渡す"
+            )
 
-    # =========================
-    # T6実行
-    # =========================
+            # T4が提案したカテゴリ名を、T5で表記ゆれ統合・新規登録する
+            final_category = resolve_category(t4_result["category"], db_path=DB_PATH)
 
-    result = save_result(
-        file_path=str(test_file),
-        classification=classification,
-    )
+            print(
+                f"[T5] 最終カテゴリ確定: {new_file} "
+                f"(category={final_category}, subtags={t4_result['subtags']}, "
+                f"summary={t4_result['summary']}) -> T6へ渡す"
+            )
 
-    # =========================
-    # 結果表示
-    # =========================
+            # T5で確定した最終カテゴリを反映したclassificationをT6に渡す
+            classification = {
+                "category": final_category,
+                "subtags": t4_result["subtags"],
+                "summary": t4_result["summary"],
+            }
 
-    print("\n=== T6実行結果 ===")
-    print(result)
+            t6_result = save_result(new_file, classification)
 
-    if result["db_saved"]:
-        print("\n[T6] 成功！")
-        print(f"ファイル移動先: {result['moved_path']}")
-        print("DB保存: 成功")
-    else:
-        print("\n[T6] 失敗")
-        print("DB保存: 失敗")
+            if t6_result["db_saved"]:
+                print(f"[T6] 保存完了: {t6_result['moved_path']}")
+            else:
+                print(
+                    f"[T6] 保存に失敗しました（ファイルは移動済みの可能性あり）: "
+                    f"{t6_result['moved_path']}"
+                )
+    except KeyboardInterrupt:
+        print("\n[T1] 監視を終了しました")
 
 
 if __name__ == "__main__":
