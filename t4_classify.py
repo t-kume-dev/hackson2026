@@ -24,10 +24,13 @@ import re
 from typing import Any, Optional
 
 import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
 
 _PROMPT_TEMPLATE = """あなたはファイル整理アシスタントです。
 以下のファイル内容を分析し、最も適切な分類をJSON形式で1つだけ返してください。
