@@ -41,10 +41,10 @@
 - [ ] テキストファイルの中身を文字列として取得できる
 - [ ] PDFから`pdfplumber`でテキストを抽出できる
 - [ ] PDF抽出結果が空（スキャンPDF）の場合、`pdf2image`＋`pytesseract`でOCRにフォールバックする
-- [ ] 写真は`pytesseract`のOCR結果とClaude Vision APIのキャプションを結合したテキストを取得できる
+- [ ] 写真はGemini API（画像入力）に渡し、OCR＋キャプションを兼ねたテキストを1回の呼び出しで取得できる
 
-### T4. Claude APIによる分類呼び出し
-**概要**：抽出コンテンツと既存カテゴリ一覧をClaude APIに渡し、category/subtags/summaryを取得する。
+### T4. Gemini APIによる分類呼び出し
+**概要**：抽出コンテンツと既存カテゴリ一覧をGemini APIに渡し、category/subtags/summaryを取得する。
 **優先度**：P0
 
 **受け入れ条件**
