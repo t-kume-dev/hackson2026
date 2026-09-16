@@ -7,10 +7,10 @@
 現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
            -> T4(classify_content) -> T5(resolve_category) -> T6(save_result)
 
-【T5・T6のDB共有について】
-- T5(t5_dedupe.py)とT6(t6_filemanager.py)は、どちらも "categories.db" という
-  同じSQLiteファイルを見る（T5がcategoriesテーブル、T6がfiles/trash_logテーブルを担当）。
-- db.py は現状どちらからも使われていない（別ファイル omakase.db を指しているため）。
+【DBについて】
+- SQLiteへのアクセスは全て db.py に集約されている（T5がcategoriesテーブル、
+  T6がfiles/trash_logテーブルを担当）。DBファイルのパスは db.DB_PATH ただ1つが正。
+- ここでは起動時に db.init_db() を呼んでテーブルを用意するだけでよい。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import sys
 
+import db
 from t1_watch import watch_folder
 from t2_screening import screen_file
 from t3_content import extract_content
@@ -27,15 +28,15 @@ from t6_filemanager import save_result
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# categoriesテーブルを持つDBファイルのパス。t5_dedupe.py / t6_filemanager.py の
-# DB_PATHと必ず同じ値にすること。
-DB_PATH = "categories.db"
-
 
 def main() -> None:
     if len(sys.argv) < 2:
         print("使い方: python main.py <監視対象フォルダのパス>")
         sys.exit(1)
+
+    # テーブルが無ければここで作る（何度呼んでも安全）
+    db.init_db()
+    print(f"[DB] 使用するDB: {db.DB_PATH}")
 
     watch_dir = sys.argv[1]
     print(f"[T1] 監視開始: {watch_dir}")
@@ -74,7 +75,7 @@ def main() -> None:
                 )
 
             # T5のDBから既存カテゴリ一覧を取得し、T4のプロンプトに渡す
-            existing_categories = get_category_names(DB_PATH)
+            existing_categories = get_category_names()
 
             # T3の出力をそのままT4に渡す
             t4_result = classify_content(t3_result, existing_categories)
@@ -91,7 +92,7 @@ def main() -> None:
             )
 
             # T4が提案したカテゴリ名を、T5で表記ゆれ統合・新規登録する
-            final_category = resolve_category(t4_result["category"], db_path=DB_PATH)
+            final_category = resolve_category(t4_result["category"])
 
             print(
                 f"[T5] 最終カテゴリ確定: {new_file} "

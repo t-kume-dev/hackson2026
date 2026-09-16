@@ -1,10 +1,10 @@
 """
-T5. カテゴリ重複防止（embeddingベース + 既存DBの categories テーブルを直接利用）
+T5. カテゴリ重複防止（embeddingベース + db.py の categories テーブルを利用）
 
-【前提】categoriesテーブルは既に存在するDB(T6と共有)の一部。
-    現状のスキーマ: categories(id INTEGER PK, name TEXT UNIQUE NOT NULL)
-    このファイルは起動時に embedding カラム(BLOB)が無ければ自動で追加する
-    （ALTER TABLE ADD COLUMN）。既存データは失われない。
+【前提】DBアクセスは全て db.py に集約されている。
+    このファイルはSQLを直接書かない。DBファイルのパスも db.DB_PATH ただ1つが正。
+    categories.embedding はNULL許容（embedding取得に失敗したカテゴリは名前だけ先に
+    登録し、次回のresolve_category呼び出しでバックフィルする）。
 
 入力: 新しいカテゴリ名（T4の出力の category）
 出力: 最終的に使うカテゴリ名（文字列）。既存流用 or 新規のどちらか。
@@ -12,10 +12,9 @@ T5. カテゴリ重複防止（embeddingベース + 既存DBの categories テ�
 - 提案されたカテゴリ名をembedding化する（task_type=SEMANTIC_SIMILARITYを指定し、
   意味的な類似度判定に最適化されたembeddingを取得する）
 - categoriesテーブルの既存カテゴリと比較する。
-  embeddingが未計算の既存カテゴリ（過去にembeddingカラムが無い時代に登録されたものなど）は
-  提案カテゴリと一緒にまとめてembedding化し、DBにキャッシュとして書き戻す
-  （2回目以降のresolve_category呼び出しではAPI呼び出し不要になる）
-- 最も類似度が高い既存カテゴリが閾値（デフォルト0.85）以上なら、そのカテゴリ名に置き換える
+  embeddingが未計算の既存カテゴリは提案カテゴリと一緒にまとめてembedding化し、
+  DBにキャッシュとして書き戻す（2回目以降はAPI呼び出し不要になる）
+- 最も類似度が高い既存カテゴリが閾値以上なら、そのカテゴリ名に置き換える
 - 閾値未満なら、新規カテゴリとしてembeddingと一緒にcategoriesテーブルへ登録して返す
 
 このファイルの中身（embeddingモデルの選定・閾値等）はT5担当の裁量。
@@ -28,16 +27,18 @@ T5. カテゴリ重複防止（embeddingベース + 既存DBの categories テ�
 
 from __future__ import annotations
 
-import array
 import logging
-import math
 import os
 import sqlite3
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, Optional, Union
 
+import numpy as np
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+import db
 
 load_dotenv()
 
@@ -49,42 +50,12 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 # 高いほど厳しく（似ていないと同一視しない）
 SIMILARITY_THRESHOLD = 0.93
 
-# categoriesテーブルを持つDBファイルのパス。T6と共有する実際のパスに合わせて
-# 呼び出し側（main.py）から resolve_category(..., db_path=...) で指定できる。
-DB_PATH = "categories.db"
+# DBファイルのパスは db.py が唯一の正。ここでは別名を張るだけ。
+DB_PATH = db.DB_PATH
 
-
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    """
-    categoriesテーブルが無ければ作成する。
-    既にテーブルがあってもembeddingカラムが無ければALTER TABLEで追加する
-    （既存の id / name のデータはそのまま残る）。
-    """
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        )
-        """
-    )
-
-    columns = [row[1] for row in conn.execute("PRAGMA table_info(categories)").fetchall()]
-    if "embedding" not in columns:
-        logger.info("[T5] categoriesテーブルにembeddingカラムが無いため追加します")
-        conn.execute("ALTER TABLE categories ADD COLUMN embedding BLOB")
-
-
-def _serialize_embedding(vector: list[float]) -> bytes:
-    """embeddingベクトルをBLOB保存用のbytesに変換する（float32で保存しサイズを抑える）"""
-    return array.array("f", vector).tobytes()
-
-
-def _deserialize_embedding(blob: bytes) -> list[float]:
-    """BLOBからembeddingベクトルを復元する"""
-    arr = array.array("f")
-    arr.frombytes(blob)
-    return list(arr)
+# カテゴリ名/ベクトルの型（DBから来るものはnumpy配列、APIから来るものはfloatのリスト）
+Vector = Union[np.ndarray, list]
+DbPath = Optional[Union[str, Path]]
 
 
 def _get_embeddings(texts: list[str]) -> Optional[list[list[float]]]:
@@ -121,87 +92,62 @@ def _get_embeddings(texts: list[str]) -> Optional[list[list[float]]]:
     return embeddings
 
 
-def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
-    """2つのベクトルのコサイン類似度を計算する（外部ライブラリ不要の素朴な実装）"""
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
+def _cosine_similarity(vec_a: Vector, vec_b: Vector) -> float:
+    """2つのベクトルのコサイン類似度を計算する。"""
+    a = np.asarray(vec_a, dtype=np.float32)
+    b = np.asarray(vec_b, dtype=np.float32)
 
-    if norm_a == 0 or norm_b == 0:
+    norm_a = float(np.linalg.norm(a))
+    norm_b = float(np.linalg.norm(b))
+
+    if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
 
-    return dot / (norm_a * norm_b)
-
-
-def _fetch_existing_categories(db_path: str) -> list[tuple[str, Optional[list[float]]]]:
-    """categoriesテーブルから (name, embeddingベクトル) の一覧を取得する。未計算はNone。"""
-    conn = sqlite3.connect(db_path)
-    try:
-        _ensure_schema(conn)
-        conn.commit()
-        rows = conn.execute("SELECT name, embedding FROM categories").fetchall()
-    finally:
-        conn.close()
-
-    return [
-        (name, _deserialize_embedding(blob) if blob is not None else None)
-        for name, blob in rows
-    ]
-
-
-def _update_embedding(name: str, vector: list[float], db_path: str) -> None:
-    """既存カテゴリ行のembeddingカラムを埋める（初回アクセス時のキャッシュ書き戻し用）"""
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute(
-            "UPDATE categories SET embedding = ? WHERE name = ?",
-            (_serialize_embedding(vector), name),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    logger.info(f"[T5] 既存カテゴリのembeddingをキャッシュに書き戻し: {name}")
-
-
-def get_category_names(db_path: str = DB_PATH) -> list[str]:
-    """既存カテゴリ名だけの一覧を返す（T4がプロンプトに埋め込む既存カテゴリ一覧として使う）"""
-    return [name for name, _ in _fetch_existing_categories(db_path)]
+    return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 def _register_new_category(
     category: str,
-    embedding_vec: Optional[list[float]],
-    db_path: str = DB_PATH,
+    embedding_vec: Optional[Vector],
+    db_path: DbPath = None,
 ) -> bool:
-    """新規カテゴリをembeddingと一緒にcategoriesテーブルへ登録する。既に同名があれば何もしない。"""
-    blob = _serialize_embedding(embedding_vec) if embedding_vec is not None else None
-
+    """
+    新規カテゴリをembeddingと一緒にcategoriesテーブルへ登録する。既に同名があれば何もしない。
+    DBエラーはここで握り潰す（カテゴリ登録に失敗してもパイプライン全体は止めない）。
+    """
     try:
-        conn = sqlite3.connect(db_path)
-        try:
-            _ensure_schema(conn)
-            conn.execute(
-                "INSERT OR IGNORE INTO categories (name, embedding) VALUES (?, ?)",
-                (category, blob),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        logger.info(f"[T5] 新規カテゴリをDBに登録: {category} ({db_path})")
-        return True
+        db.insert_category(category, embedding_vec, db_path)
     except sqlite3.Error as e:
         logger.error(f"[T5] DB登録に失敗: {category} ({e})")
         return False
 
+    logger.info(f"[T5] 新規カテゴリをDBに登録: {category}")
+    return True
+
+
+def _update_embedding(name: str, vector: Vector, db_path: DbPath = None) -> None:
+    """既存カテゴリ行のembeddingカラムを埋める（初回アクセス時のキャッシュ書き戻し用）"""
+    try:
+        db.update_category_embedding(name, vector, db_path)
+    except sqlite3.Error as e:
+        logger.error(f"[T5] embeddingのキャッシュ書き戻しに失敗: {name} ({e})")
+        return
+    logger.info(f"[T5] 既存カテゴリのembeddingをキャッシュに書き戻し: {name}")
+
+
+def get_category_names(db_path: DbPath = None) -> list[str]:
+    """既存カテゴリ名だけの一覧を返す（T4がプロンプトに埋め込む既存カテゴリ一覧として使う）"""
+    return db.get_category_names(db_path)
+
 
 def resolve_category(
     proposed_category: str,
-    db_path: str = DB_PATH,
+    db_path: DbPath = None,
     threshold: float = SIMILARITY_THRESHOLD,
     embed_fn: Callable[[list[str]], Optional[list[list[float]]]] = _get_embeddings,
-    fetch_fn: Callable[[str], list[tuple[str, Optional[list[float]]]]] = _fetch_existing_categories,
-    register_fn: Callable[[str, Optional[list[float]], str], bool] = _register_new_category,
-    update_fn: Callable[[str, list[float], str], None] = _update_embedding,
+    fetch_fn: Callable[[DbPath], list[tuple[str, Optional[np.ndarray]]]] = db.get_category_embeddings,
+    register_fn: Callable[[str, Optional[Vector], DbPath], bool] = _register_new_category,
+    update_fn: Callable[[str, Vector, DbPath], None] = _update_embedding,
 ) -> str:
     """
     T4が提案したカテゴリ名を、DB内の既存カテゴリ(embedding込み)と比較し、
@@ -210,7 +156,7 @@ def resolve_category(
 
     Args:
         proposed_category: T4が提案したカテゴリ名（入力）
-        db_path: categoriesテーブルを持つSQLiteファイルのパス（T6と共有）
+        db_path: SQLiteファイルのパス。省略時は db.DB_PATH（通常は省略してよい）
         threshold: コサイン類似度の判定しきい値
         embed_fn / fetch_fn / register_fn / update_fn: テスト時に差し替え可能な依存関数
 
@@ -244,7 +190,7 @@ def resolve_category(
     for name, vec in zip(missing_names, missing_vecs):
         update_fn(name, vec, db_path)
 
-    vec_by_name: dict[str, list[float]] = {
+    vec_by_name: dict[str, Vector] = {
         name: vec for name, vec in existing if vec is not None
     }
     vec_by_name.update(zip(missing_names, missing_vecs))

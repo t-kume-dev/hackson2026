@@ -1,33 +1,37 @@
 """
 T6. ファイル移動＋メタデータ保存
 
-【変更点】db.py は使わない。T5(t5_dedupe.py)が実際に使っている categories.db と
-同じファイルに、T6が自分で files / trash_log テーブルを作って書き込む。
-categories テーブルには一切触れない（T5の領域）。
+【前提】DBアクセスは全て db.py に集約されている。
+    このファイルはSQLを直接書かない。DBファイルのパスも db.DB_PATH ただ1つが正。
+    担当テーブルは files / trash_log（categoriesはT5の領域なので触らない）。
 
-db.py / t5_dedupe.py はどちらも変更しない前提。
+入力: ファイルパス + 分類結果一式（category / subtags / summary）
+出力: {"moved_path": 移動後のパス, "db_saved": DB保存に成功したか}
+
+なお files.embedding はここで sentence-transformers を使って作る。
+T5が categories.embedding に入れるGemini embeddingとは次元もモデルも別物なので、
+T7の意味検索で files.embedding と比較する際は必ずこのファイルと同じモデル
+（EMBEDDING_MODEL_NAME）でクエリをembedding化すること。
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+import db
+
 logger = logging.getLogger(__name__)
 
-# T5(t5_dedupe.py)のDB_PATHデフォルト値と同じファイルを指す。
-# T5側のDB_PATHを変更する場合は、必ずこちらも同じ値に合わせること。
-DB_PATH = "categories.db"
-
-ORGANIZED_ROOT = Path("organized")
+# 整理後のファイルを置くルート。実行時のカレントディレクトリに依存しないよう
+# このファイルの場所を基準にする。
+ORGANIZED_ROOT = Path(__file__).parent / "organized"
 
 EXTENSION_TYPE_MAP = {
     ".txt": "text",
@@ -42,44 +46,6 @@ EXTENSION_TYPE_MAP = {
 
 EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 _embedding_model: Optional[SentenceTransformer] = None
-
-# T6が責任を持つテーブルだけを作る。categoriesテーブルには一切触れない。
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    filetype TEXT NOT NULL,
-    category TEXT NOT NULL,
-    subtags TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    embedding BLOB NOT NULL,
-    hash TEXT NOT NULL,
-    file_size INTEGER NOT NULL,
-    created_at DATETIME NOT NULL,
-    last_accessed_at DATETIME,
-    status TEXT NOT NULL DEFAULT 'active'
-);
-
-CREATE TABLE IF NOT EXISTS trash_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id INTEGER NOT NULL REFERENCES files(id),
-    original_path TEXT NOT NULL,
-    action_type TEXT NOT NULL,
-    acted_at DATETIME NOT NULL
-);
-"""
-
-
-def _get_connection() -> sqlite3.Connection:
-    """
-    categories.db への接続を返す。files/trash_logテーブルが無ければここで作成する
-    （毎回チェックするだけなので、既にあれば何もしない＝安全に何度呼んでもよい）。
-    categoriesテーブルには一切関与しない（T5が管理するため）。
-    """
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(_SCHEMA)
-    return conn
 
 
 def _get_embedding_model() -> SentenceTransformer:
@@ -109,7 +75,7 @@ def _move_to_category_folder(file_path: Path, category: str) -> Path:
     """カテゴリフォルダへファイルを移動する"""
     safe_category = "".join(
         c for c in category
-        if c not in '\\/:*?"<>|'
+        if c not in r'\/:*?"<>|'
     ).strip() or "未分類"
 
     destination_dir = ORGANIZED_ROOT / safe_category
@@ -137,48 +103,9 @@ def _create_embedding(category: str, subtags: list[str], summary: str) -> np.nda
     return np.asarray(embedding, dtype=np.float32)
 
 
-def _insert_file(
-    conn: sqlite3.Connection,
-    path: str,
-    filetype: str,
-    category: str,
-    subtags: list[str],
-    summary: str,
-    embedding: np.ndarray,
-    file_hash: str,
-    file_size: int,
-) -> int:
-    filename = Path(path).name
-    cursor = conn.execute(
-        """
-        INSERT INTO files
-            (path, filename, filetype, category, subtags, summary,
-             embedding, hash, file_size, created_at, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-        """,
-        (
-            path, filename, filetype, category,
-            json.dumps(subtags, ensure_ascii=False), summary,
-            np.asarray(embedding, dtype=np.float32).tobytes(), file_hash, file_size,
-            datetime.now().isoformat(),
-        ),
-    )
-    return cursor.lastrowid
-
-
-def _insert_trash_log(conn: sqlite3.Connection, file_id: int, original_path: str, action_type: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO trash_log (file_id, original_path, action_type, acted_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (file_id, original_path, action_type, datetime.now().isoformat()),
-    )
-
-
 def save_result(file_path: str, classification: dict) -> dict:
     """
-    ファイルをカテゴリフォルダへ移動し、categories.db の files/trash_log に保存する。
+    ファイルをカテゴリフォルダへ移動し、files/trash_logテーブルに保存する。
 
     classification:
         {"category": str, "subtags": list[str], "summary": str}
@@ -217,11 +144,12 @@ def save_result(file_path: str, classification: dict) -> dict:
         logger.error(f"[T6] ファイル移動に失敗しました: {e}")
         return {"moved_path": file_path, "db_saved": False}
 
+    # filesへのINSERTとtrash_logへのINSERTは1つのトランザクションにまとめる
+    # （片方だけ残ってUndoできなくなるのを防ぐ）
     try:
-        conn = _get_connection()
+        conn = db.get_connection()
         try:
-            file_id = _insert_file(
-                conn,
+            file_id = db.insert_file(
                 path=str(moved_path),
                 filetype=filetype,
                 category=category,
@@ -230,8 +158,14 @@ def save_result(file_path: str, classification: dict) -> dict:
                 embedding=embedding,
                 file_hash=file_hash,
                 file_size=file_size,
+                conn=conn,
             )
-            _insert_trash_log(conn, file_id=file_id, original_path=original_path, action_type="move")
+            db.insert_trash_log(
+                file_id=file_id,
+                original_path=original_path,
+                action_type="move",
+                conn=conn,
+            )
             conn.commit()
         finally:
             conn.close()
@@ -247,11 +181,5 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     print("T6 t6_filemanager.py")
-    print(f"DB: {DB_PATH}（categoriesテーブル以外はT6が自分で管理）")
-
-    # 動作確認用サンプル（実際に試す場合はテスト用ファイルを用意してパスを書き換える）
-    # result = save_result(
-    #     "C:/sample/memo.txt",
-    #     {"category": "レポート", "subtags": ["ハッカソン"], "summary": "テスト用の要約"},
-    # )
-    # print(result)
+    print(f"DB: {db.DB_PATH}（files / trash_log を担当。categoriesはT5の領域）")
+    print(f"整理先ルート: {ORGANIZED_ROOT}")
