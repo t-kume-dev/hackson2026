@@ -1,0 +1,340 @@
+"""
+T6. ファイル移動＋メタデータ保存
+
+DB操作は db.py に任せる。
+T6ではファイルの移動と、保存するデータの準備を担当する。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from pathlib import Path
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+from db import insert_file, insert_trash_log
+
+logger = logging.getLogger(__name__)
+
+ORGANIZED_ROOT = Path("organized")
+
+EXTENSION_TYPE_MAP = {
+    ".txt": "text",
+    ".md": "text",
+    ".csv": "text",
+    ".pdf": "pdf",
+    ".png": "photo",
+    ".jpg": "photo",
+    ".jpeg": "photo",
+    ".gif": "photo",
+}
+
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """embeddingモデルを初回だけ読み込む"""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _embedding_model
+
+
+def _guess_filetype(file_path: str) -> str:
+    """拡張子からfiletypeを判定する"""
+    extension = Path(file_path).suffix.lower()
+    return EXTENSION_TYPE_MAP.get(extension, "unknown")
+
+
+def _calculate_hash(file_path: Path) -> str:
+    """ファイルのSHA-256ハッシュを計算する"""
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _move_to_category_folder(file_path: Path, category: str) -> Path:
+    """カテゴリフォルダへファイルを移動する"""
+    safe_category = "".join(
+        c for c in category
+        if c not in '\\/:*?"<>|'
+    ).strip() or "未分類"
+
+    destination_dir = ORGANIZED_ROOT / safe_category
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    destination = destination_dir / file_path.name
+    counter = 1
+
+    while destination.exists():
+        destination = (
+            destination_dir
+            / f"{file_path.stem}_{counter}{file_path.suffix}"
+        )
+        counter += 1
+
+    file_path.rename(destination)
+    return destination
+
+
+def _create_embedding(
+    category: str,
+    subtags: list[str],
+    summary: str,
+) -> np.ndarray:
+    """カテゴリ・サブタグ・要約からembeddingを作る"""
+    text = " ".join([
+        category,
+        summary,
+        " ".join(subtags),
+    ]).strip()
+
+    model = _get_embedding_model()
+    embedding = model.encode(text)
+    return np.asarray(embedding, dtype=np.float32)
+
+
+def save_result(file_path: str, classification: dict) -> dict:
+    """
+    ファイルをカテゴリフォルダへ移動し、DBにメタデータを保存する。
+
+    classification:
+        {
+            "category": str,
+            "subtags": list[str],
+            "summary": str
+        }
+
+    Returns:
+        {
+            "moved_path": str,
+            "db_saved": bool
+        }
+    """
+
+    source = Path(file_path)
+
+    if not source.exists():
+        logger.error(f"[T6] ファイルが存在しません: {file_path}")
+        return {
+            "moved_path": file_path,
+            "db_saved": False,
+        }
+
+    category = classification.get("category")
+    subtags = classification.get("subtags", [])
+    summary = classification.get("summary", "")
+
+    if not category:
+        logger.error(f"[T6] categoryがありません: {classification}")
+        return {
+            "moved_path": file_path,
+            "db_saved": False,
+        }
+
+    original_path = str(source)
+    filetype = _guess_filetype(file_path)
+    file_hash = _calculate_hash(source)
+    file_size = source.stat().st_size
+
+    try:
+        embedding = _create_embedding(
+            category,
+            subtags,
+            summary,
+        )
+    except Exception as e:
+        logger.error(f"[T6] embedding生成に失敗しました: {e}")
+        return {
+            "moved_path": file_path,
+            "db_saved": False,
+        }
+
+    try:
+        moved_path = _move_to_category_folder(
+            source,
+            category,
+        )
+    except OSError as e:
+        logger.error(f"[T6] ファイル移動に失敗しました: {e}")
+        return {
+            "moved_path": file_path,
+            "db_saved": False,
+        }
+
+    try:
+        file_id = insert_file(
+            path=str(moved_path),
+            filetype=filetype,
+            category=category,
+            subtags=subtags,
+            summary=summary,
+            embedding=embedding,
+            file_hash=file_hash,
+            file_size=file_size,
+        )
+
+        insert_trash_log(
+            file_id=file_id,
+            original_path=original_path,
+            action_type="move",
+        )
+
+    except Exception as e:
+        logger.error(f"[T6] DB保存に失敗しました: {e}")
+        return {
+            "moved_path": str(moved_path),
+            "db_saved": False,
+        }
+
+    logger.info(
+        f"[T6] 保存完了: {original_path} -> {moved_path}"
+    )
+
+    return {
+        "moved_path": str(moved_path),
+        "db_saved": True,
+    }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    print("T6 file_manager.py")
+    print("DB操作は db.py を使用します。")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+T6単体テスト
+
+T1〜T4は使わず、T4から渡ってくる想定の分類結果を
+仮データとしてT6に直接渡す。
+"""
+
+from pathlib import Path
+
+from db import init_db
+from t6_filemanager import save_result
+
+
+def main() -> None:
+    # =========================
+    # DBを初期化
+    # =========================
+
+    init_db()
+
+    # =========================
+    # T6用の仮ファイルを作成
+    # =========================
+
+    test_file = Path("t6_test.txt")
+
+    test_file.write_text(
+        """社内プロジェクトの会議メモ
+
+プロジェクト名：おまかせ整理Bot
+
+本日の打ち合わせ内容：
+・ファイル自動整理機能について確認
+・Gemini APIを利用したファイル分類を実装
+・分類されたファイルをカテゴリごとのフォルダーへ移動
+・SQLiteデータベースにファイル情報を保存
+・今後は意味検索機能を追加する予定
+
+次回までのタスク：
+・T6のファイル移動処理を確認する
+・データベースへの保存結果を確認する
+""",
+        encoding="utf-8",
+    )
+
+    print("=== T6単体テスト開始 ===")
+    print(f"テストファイル: {test_file}")
+
+    # =========================
+    # T4から渡ってくる想定の仮データ
+    # =========================
+
+    classification = {
+        "category": "プロジェクト",
+        "subtags": [
+            "会議",
+            "開発",
+            "ファイル整理",
+        ],
+        "summary": "おまかせ整理Botの開発に関する会議メモ",
+    }
+
+    print("仮の分類結果:")
+    print(classification)
+
+    # =========================
+    # T6実行
+    # =========================
+
+    result = save_result(
+        file_path=str(test_file),
+        classification=classification,
+    )
+
+    # =========================
+    # 結果表示
+    # =========================
+
+    print("\n=== T6実行結果 ===")
+    print(result)
+
+    if result["db_saved"]:
+        print("\n[T6] 成功！")
+        print(f"ファイル移動先: {result['moved_path']}")
+        print("DB保存: 成功")
+    else:
+        print("\n[T6] 失敗")
+        print("DB保存: 失敗")
+
+
+if __name__ == "__main__":
+    main()
