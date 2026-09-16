@@ -1,95 +1,91 @@
 """
-配線担当（SM）が書く部分。
+T6単体テスト
 
-「前のチケットの出力を次のチケットに渡す」処理だけをここに書く。
-各チケットの中身には一切踏み込まない。
-
-現状の配線: T1(watch_folder) -> T2(screen_file) -> T3(extract_content)
-           -> T4(classify_content) -> (T5以降は未実装なのでprintのみ)
-
-【T3の出力形式】常にdict。中身は filetype で判別する。
-- filetype が "text" / "pdf" の場合: {"filetype", "file_path", "content"}
-- filetype が "photo" の場合       : {"filetype", "file_path", "image_bytes", "mime_type"}
-
-【T4の出力形式】成功時 {"category", "subtags", "summary"} のdict、失敗時None
-
-既存カテゴリ一覧は本来T5(カテゴリ重複防止)がDBを見て管理する想定だが、
-T5が未実装のため暫定的に空リストを渡している。
+T1〜T4は使わず、T4から渡ってくる想定の分類結果を
+仮データとしてT6に直接渡す。
 """
 
-from __future__ import annotations
+from pathlib import Path
 
-import logging
-import sys
-
-from t1_watch import watch_folder
-from t2_screening import screen_file
-from t3_content import extract_content
-from t4_classify import classify_content
-
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# T5未実装のための暫定値。T5ができたら「DBから既存カテゴリ一覧を取得する処理」に差し替える。
-EXISTING_CATEGORIES: list[str] = []
+from db import init_db
+from t6_filemanager import save_result
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("使い方: python main.py <監視対象フォルダのパス>")
-        sys.exit(1)
+    # =========================
+    # DBを初期化
+    # =========================
 
-    watch_dir = sys.argv[1]
-    print(f"[T1] 監視開始: {watch_dir}")
-    print("(Ctrl+Cで終了)")
+    init_db()
 
-    try:
-        for new_file in watch_folder(watch_dir):
-            # T1の出力をそのままT2に渡す
-            file_type = screen_file(new_file)
+    # =========================
+    # T6用の仮ファイルを作成
+    # =========================
 
-            if file_type is None:
-                # T2で除外されたので後続処理には渡さない
-                continue
+    test_file = Path("t6_test.txt")
 
-            print(f"[T2] 処理対象と判定: {new_file} (種別: {file_type}) -> T3へ渡す")
+    test_file.write_text(
+        """社内プロジェクトの会議メモ
 
-            # T2の出力（ファイルパス＋種別）をそのままT3に渡す
-            t3_result = extract_content(new_file, file_type)
+プロジェクト名：おまかせ整理Bot
 
-            if t3_result is None:
-                # T3で抽出失敗/無効だったので後続処理には渡さない
-                print(f"[T3] コンテンツ抽出失敗のためスキップ: {new_file}")
-                continue
+本日の打ち合わせ内容：
+・ファイル自動整理機能について確認
+・Gemini APIを利用したファイル分類を実装
+・分類されたファイルをカテゴリごとのフォルダーへ移動
+・SQLiteデータベースにファイル情報を保存
+・今後は意味検索機能を追加する予定
 
-            if t3_result["filetype"] == "photo":
-                size_kb = len(t3_result["image_bytes"]) / 1024
-                print(
-                    f"[T3] 画像を読み込み完了: {t3_result['file_path']} "
-                    f"({t3_result['mime_type']}, {size_kb:.1f}KB) -> T4へ画像入力として渡す"
-                )
-            else:
-                preview = t3_result["content"][:100].replace("\n", " ")
-                print(
-                    f"[T3] コンテンツ抽出完了: {t3_result['file_path']} "
-                    f"(先頭100文字: {preview}...) -> T4へテキスト入力として渡す"
-                )
+次回までのタスク：
+・T6のファイル移動処理を確認する
+・データベースへの保存結果を確認する
+""",
+        encoding="utf-8",
+    )
 
-            # T3の出力をそのままT4に渡す
-            t4_result = classify_content(t3_result, EXISTING_CATEGORIES)
+    print("=== T6単体テスト開始 ===")
+    print(f"テストファイル: {test_file}")
 
-            if t4_result is None:
-                # T4で分類失敗したので後続処理には渡さない
-                print(f"[T4] 分類失敗のためスキップ: {new_file}")
-                continue
+    # =========================
+    # T4から渡ってくる想定の仮データ
+    # =========================
 
-            # ここでT5(カテゴリ重複防止)に渡すイメージ（今はprintのみ）
-            print(
-                f"[T4] 分類完了: {new_file} "
-                f"(category={t4_result['category']}, subtags={t4_result['subtags']}) "
-                f"-> T5へ渡す"
-            )
-    except KeyboardInterrupt:
-        print("\n[T1] 監視を終了しました")
+    classification = {
+        "category": "プロジェクト",
+        "subtags": [
+            "会議",
+            "開発",
+            "ファイル整理",
+        ],
+        "summary": "おまかせ整理Botの開発に関する会議メモ",
+    }
+
+    print("仮の分類結果:")
+    print(classification)
+
+    # =========================
+    # T6実行
+    # =========================
+
+    result = save_result(
+        file_path=str(test_file),
+        classification=classification,
+    )
+
+    # =========================
+    # 結果表示
+    # =========================
+
+    print("\n=== T6実行結果 ===")
+    print(result)
+
+    if result["db_saved"]:
+        print("\n[T6] 成功！")
+        print(f"ファイル移動先: {result['moved_path']}")
+        print("DB保存: 成功")
+    else:
+        print("\n[T6] 失敗")
+        print("DB保存: 失敗")
 
 
 if __name__ == "__main__":
