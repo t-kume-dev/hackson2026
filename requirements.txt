@@ -1,3 +1,7 @@
 google-generativeai
 python-dotenv
 watchdog
+pdfplumber
+pdf2image
+pytesseract
+Pillow
