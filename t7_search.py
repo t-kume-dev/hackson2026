@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 # 返す件数。カードが大きいのでパネル幅では3件が上限。
 DEFAULT_LIMIT = 3
 
+# 「今日入れたやつ」のような一覧系のクエリで返す件数。
+# 意味で絞られていないぶん、もう少し見せたほうが役に立つ。
+LIST_LIMIT = 5
+
 # これ未満の類似度しかないものは「見つからなかった」と答える。
 # 無理に何か返すより、外した結果を出さないほうが信用される。
 # e5のコサイン類似度は無関係な文でも0.78前後まで出るため、絶対値だけでは切れない。
@@ -92,6 +96,17 @@ FILETYPE_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 
 # 意味を持たない助詞などは検索語としても除外する（ファイル名の直接一致判定用）
 PARTICLES = re.compile(r"[のをでにがはやとも、。！？!?\s]+")
+
+# 中身を指していない言い回し。embeddingにかける前に落とす。
+# 「今日入れたやつ」のようなクエリは、期間を抜くと「入れたやつ」しか残らず、
+# これをembeddingに投げると何にも似ていない扱いになって0件で返ってしまう。
+# ここを削って何も残らなければ、絞り込みだけで新しい順に返す（= 一覧表示）。
+FILLER = re.compile(
+    r"入れた|保存した|落とした|ダウンロードした|入れとい|しまった|置いた"
+    r"|見せて|出して|探して|教えて|開いて|表示して|ちょうだい"
+    r"|どこ|どれ|だっけ|かな|かしら|たい|ある|あった|した|してた"
+    r"|やつ|もの|ファイル|データ|一覧|全部|さっきの|あの|その|この"
+)
 
 
 @dataclass
@@ -147,7 +162,10 @@ def parse_query(query: str) -> ParsedQuery:
             text = pattern.sub(" ", text)
             break
 
-    text = text.strip()
+    # 中身を指していない言い回しを落とす。ここで空になったクエリは
+    # 「条件に合うものを一覧で見せて」という意味だと解釈する。
+    text = FILLER.sub(" ", text)
+    text = PARTICLES.sub(" ", text).strip()
     if not text:
         # 「先週のやつ」のように条件しか言われなかった場合。
         # embeddingは効かせず、絞り込みだけで新しい順に返す。
@@ -207,9 +225,10 @@ def search(
     if not candidates:
         return SearchResult(query=query, parsed=parsed, hits=[])
 
-    # 条件だけ指定された場合（「先週のやつ」等）は新しい順に返す
+    # 条件だけ指定された場合（「今日入れたやつ」等）は一覧として新しい順に返す。
+    # 意味で絞る材料が無いので、スコアではなく新しさが唯一の手がかりになる。
     if not parsed.text:
-        hits = [SearchHit(file=f, score=1.0) for f in candidates[:limit]]
+        hits = [SearchHit(file=f, score=1.0) for f in candidates[:LIST_LIMIT]]
         return SearchResult(query=query, parsed=parsed, hits=hits)
 
     try:

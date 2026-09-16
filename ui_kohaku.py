@@ -251,6 +251,11 @@ class FileCard(QFrame):
         """既定アプリに投げる。ビューアは持たないので、ここで会話は引っ込める。"""
         if t7.open_file(self.file):
             self.panel.hide_panel()
+            # 既定アプリのウィンドウは少し遅れて前面に出てくるので、
+            # その後にもう一度キャラを押し上げる（1回だけだと裏に隠れる）
+            mascot = self.panel.state.mascot
+            for delay in (400, 1200, 2500):
+                QTimer.singleShot(delay, mascot.ensure_on_top)
         else:
             self.panel.say("あれ、そのファイルが見つからない。<br>外で移動か削除をされたのかも。")
 
@@ -304,6 +309,14 @@ class ChatPanel(QWidget):
         self.log.addStretch(1)
         self.scroll.setWidget(self.log_widget)
         inner.addWidget(self.scroll, 1)
+
+        # 新しい発言が入るたびに最下部へ追従する。
+        # 吹き出しは折り返しで高さが後から決まるので、追加直後にスクロールしても
+        # まだ伸びきっておらず届かない。高さが確定した瞬間（rangeChanged）に動かす。
+        bar = self.scroll.verticalScrollBar()
+        bar.rangeChanged.connect(self._follow_bottom)
+        bar.valueChanged.connect(self._check_follow)
+        self._follow = True
 
         inner.addWidget(self._build_composer())
 
@@ -384,8 +397,21 @@ class ChatPanel(QWidget):
         return widget
 
     def _scroll_to_bottom(self) -> None:
+        self._follow = True
         bar = self.scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    def _follow_bottom(self) -> None:
+        """ログの高さが変わったとき、追従中なら最下部へ。"""
+        if not self._follow:
+            return
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _check_follow(self, value: int) -> None:
+        """自分で上へスクロールしたら追従をやめる。下端に戻したら再開する。"""
+        bar = self.scroll.verticalScrollBar()
+        self._follow = value >= bar.maximum() - 8
 
     def say(self, text: str) -> Bubble:
         """コハク側の発言。"""
@@ -539,6 +565,7 @@ class ChatPanel(QWidget):
     def hide_panel(self) -> None:
         self.hide()
         self.state.mascot.show()
+        self.state.mascot.ensure_on_top()
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -643,11 +670,43 @@ class Mascot(QWidget):
         self._moved = False
         self.working = False
 
+        # 他のアプリを開くと、最前面指定があってもその下に潜ってしまうことがある。
+        # （特にファイルを既定アプリで開いた直後。相手が前面を奪う）
+        # 定期的に最前面へ押し上げ直す。フォーカスは奪わない。
+        self.topmost_timer = QTimer(self)
+        self.topmost_timer.timeout.connect(self.ensure_on_top)
+        self.topmost_timer.start(1500)
+
         # 処理中の明滅
         self.phase = 0.0
         self.animation = QTimer(self)
         self.animation.timeout.connect(self._tick)
         self.animation.start(60)
+
+    def ensure_on_top(self) -> None:
+        """
+        フォーカスを奪わずに最前面へ戻す。
+
+        raise_() はウィンドウをアクティブ化しようとして、入力中のアプリから
+        フォーカスを取り上げてしまうことがある。Windowsでは SetWindowPos を
+        SWP_NOACTIVATE 付きで直接呼び、「最前面に置くが触らない」を実現する。
+        """
+        if not self.isVisible():
+            return
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                HWND_TOPMOST = -1
+                SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+                ctypes.windll.user32.SetWindowPos(
+                    int(self.winId()), HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+                )
+                return
+            except Exception as e:  # ctypesが使えない環境ではQtの方法に落とす
+                logger.debug(f"[UI] SetWindowPosに失敗しました: {e}")
+        self.raise_()
 
     def _tick(self) -> None:
         if self.working:
