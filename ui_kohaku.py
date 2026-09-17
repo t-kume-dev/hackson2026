@@ -674,29 +674,29 @@ class ChatPanel(QWidget):
             lambda name: self._pick_category(file_id, name),
         )
 
-    def _pick_category(self, file_id: int, category: str) -> None:
-        if category == self.NEW_CATEGORY:
-            name, ok = QInputDialog.getText(self, "新しいカテゴリ", "カテゴリ名を入れてください")
-            name = name.strip() if ok else ""
-            if not name:
-                self.say("そのままにしておくね。")
+        def _pick_category(self, file_id: int, category: str) -> None:
+            if category == self.NEW_CATEGORY:
+                name, ok = QInputDialog.getText(self, "新しいカテゴリ", "カテゴリ名を入れてください")
+                name = name.strip() if ok else ""
+                if not name:
+                    self.say("そのままにしておくね。")
+                    return
+                category = name
+
+            moved = t6.recategorize(file_id, category)
+            if not moved:
+                self.say("移せなかった。ファイルが見当たらない。")
                 return
-            category = name
 
-        moved = t6.recategorize(file_id, category)
-        if not moved:
-            self.say("移せなかった。ファイルが見当たらない。")
-            return
+            # 新しいカテゴリは categories テーブルにも登録しておく。
+            # ここを忘れると、次の分類でT4のプロンプトに候補として出てこない。
+            if category not in db.get_category_names():
+                db.insert_category(category)
 
-        # 新しいカテゴリは categories テーブルにも登録しておく。
-        # ここを忘れると、次の分類でT4のプロンプトに候補として出てこない。
-        if category not in db.get_category_names():
-            db.insert_category(category)
-
-        self.say(f"「{category}」に移したよ。")
-        file = db.get_file(file_id)
-        if file is not None:
-            self.add_cards([file])
+            self.say(f"「{category}」に移したよ。")
+            file = db.get_file(file_id)
+            if file is not None:
+                self.add_cards([file])
 
         # --- 削除・Undo（T9） -----------------------------------------------------
 

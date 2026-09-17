@@ -1,12 +1,17 @@
 """
 T9: ゴミ箱・Undo
 
-T8のtrash_file()や、db.update_file_location()経由の移動を1件取り消す。
-常に「直近の1件」だけを対象にする（db.get_last_action()がtrash_logの最新行を返す）。
+db.pyは変更しない。db.get_connection()で得た接続を使い、
+trash_log / files テーブルへは直接SQLでアクセスする。
 
-実ファイルを先にcurrent_path -> original_pathへ戻し、成功してからDBを更新する。
-T8のtrash_file()と同じ理由（食い違いを作らないため）で、DB更新に失敗したら
-実ファイルの移動もロールバックする。
+前提:
+- 削除は db.mark_trashed() が元々 trash_log に action_type='delete', original_path
+  付きで記録している（db.py側は無変更）
+- 「移動」（カテゴリ訂正など）のUndoに対応するには、呼び出し側が移動の前に
+  record_move() を呼んで同じtrash_logに記録しておく必要がある
+- ファイルは常に organized/<カテゴリ>/ファイル名 の構成で保存されている前提なので、
+  original_path の親フォルダ名をそのままカテゴリとして復元する（専用カラムは増やさない）
+- Undo対象は常に有効なファイルだった前提なので、戻すステータスは常に'active'
 """
 
 from __future__ import annotations
@@ -20,22 +25,48 @@ import db
 logger = logging.getLogger(__name__)
 
 
-def peek_last_action() -> Optional[dict]:
+def record_move(file_id: int, original_path: str) -> None:
     """
-    直近のmove/delete操作の情報を返す（何も変更しない）。
-    UI側で「〇〇を元に戻しますか？」と確認表示するのに使う。
+    移動（カテゴリ訂正など）をUndoできるよう記録する。
+    db.update_file_location()はtrash_logに書かないので、呼び出し側で
+    実際の移動処理の前にこれを呼ぶ。db.pyの既存関数をそのまま使うだけ。
     """
-    return db.get_last_action()
+    db.insert_trash_log(file_id, original_path, "move")
+
+
+def get_last_action() -> Optional[dict]:
+    """直近のmove/delete操作を返す（DBは変更しない）。"""
+    conn = db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM trash_log ORDER BY acted_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        file_row = conn.execute(
+            "SELECT path FROM files WHERE id = ?", (row["file_id"],)
+        ).fetchone()
+    finally:
+        conn.close()
+    if file_row is None:
+        return None
+    original_path = Path(row["original_path"])
+    return {
+        "log_id": row["id"],
+        "file_id": row["file_id"],
+        "action_type": row["action_type"],
+        "current_path": file_row["path"],
+        "original_path": str(original_path),
+        "original_category": original_path.parent.name or None,
+    }
 
 
 def undo_last_action() -> Optional[dict]:
     """
     直近のmove/delete操作を1件取り消す。
-
-    Returns:
-        取り消した操作の情報(dict)。取り消す対象が無い/失敗した場合はNone。
+    実ファイルをcurrent_path -> original_pathへ戻してから、files/trash_logを更新する。
     """
-    action = db.get_last_action()
+    action = get_last_action()
     if action is None:
         logger.info("[T9] 元に戻す操作がありません")
         return None
@@ -46,9 +77,7 @@ def undo_last_action() -> Optional[dict]:
     if not current.exists():
         logger.error(f"[T9] 復元元のファイルが見つかりません: {current}")
         return None
-
     if original.exists():
-        # 元の場所に別のファイルができていたら、上書きせず諦める
         logger.error(f"[T9] 復元先に既に別のファイルがあります: {original}")
         return None
 
@@ -60,12 +89,27 @@ def undo_last_action() -> Optional[dict]:
         logger.error(f"[T9] ファイルを元に戻せませんでした: {current} -> {original} ({e})")
         return None
 
+    conn = db.get_connection()
     try:
-        db.apply_undo(action["log_id"])
+        with conn:
+            category = action["original_category"]
+            if category:
+                conn.execute(
+                    "UPDATE files SET path = ?, filename = ?, category = ?, status = 'active' WHERE id = ?",
+                    (str(original), original.name, category, action["file_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE files SET path = ?, filename = ?, status = 'active' WHERE id = ?",
+                    (str(original), original.name, action["file_id"]),
+                )
+            conn.execute("DELETE FROM trash_log WHERE id = ?", (action["log_id"],))
     except Exception:
         # DB更新に失敗したら実ファイルも戻して食い違いを作らない
         original.rename(current)
         raise
+    finally:
+        conn.close()
 
     logger.info(f"[T9] 元に戻しました({action['action_type']}): {current} -> {original}")
     return action
