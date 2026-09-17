@@ -220,10 +220,15 @@ def resolve_category(
             if _parent_parts(name) == resolved_parts
         }
 
+        # 新規採用するときは、上の階層で既存の表記に寄せた親の下に作る
+        # （proposed_full をそのまま使うと、親が寄せる前の表記に戻ってしまう）
+        new_parts = resolved_parts + [proposed_parts[i]]
+        new_full = CATEGORY_SEPARATOR.join(new_parts)
+
         if not siblings:
-            logger.info(f"[T5] 兄弟カテゴリが無いため新規採用: {proposed_full}")
-            register_fn(proposed_full, proposed_vec, db_path)
-            resolved_parts = proposed_parts[: i + 1]
+            logger.info(f"[T5] 兄弟カテゴリが無いため新規採用: {new_full}")
+            register_fn(new_full, proposed_vec, db_path)
+            resolved_parts = new_parts
             continue
 
         best_name: Optional[str] = None
@@ -242,10 +247,10 @@ def resolve_category(
             resolved_parts = best_name.split(CATEGORY_SEPARATOR)
         else:
             logger.info(
-                f"[T5] 最高類似度{best_score:.4f}が閾値{threshold}未満のため新規採用: {proposed_full}"
+                f"[T5] 最高類似度{best_score:.4f}が閾値{threshold}未満のため新規採用: {new_full}"
             )
-            register_fn(proposed_full, proposed_vec, db_path)
-            resolved_parts = proposed_parts[: i + 1]
+            register_fn(new_full, proposed_vec, db_path)
+            resolved_parts = new_parts
 
     return CATEGORY_SEPARATOR.join(resolved_parts)
 
