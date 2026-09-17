@@ -193,6 +193,7 @@ AIの分類は必ず外れる。外れたまま直せないと、ユーザーは
 | created_at | DATETIME | 検出日時 |
 | last_accessed_at | DATETIME | 最終アクセス日時（分類時に created_at で初期化） |
 | status | TEXT | active / trashed |
+| kept_at | DATETIME | 片付けタイムで「残す」を選んだ日時（NULL許容。T8） |
 
 **categories テーブル**
 | カラム | 型 | 内容 |

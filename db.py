@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS files (
     file_size INTEGER NOT NULL,
     created_at DATETIME NOT NULL,
     last_accessed_at DATETIME,
-    status TEXT NOT NULL DEFAULT 'active'
+    status TEXT NOT NULL DEFAULT 'active',
+    kept_at DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS categories (
@@ -79,10 +80,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     embeddingカラムが無い時代のcategoriesテーブルが残っていても、
     既存の id / name のデータを保ったままカラムを追加する。
     last_accessed_at が空のまま残っている行は created_at で埋める。
+    kept_at（T8）が無い時代のfilesテーブルには列を足す。
     """
     columns = [row[1] for row in conn.execute("PRAGMA table_info(categories)").fetchall()]
     if "embedding" not in columns:
         conn.execute("ALTER TABLE categories ADD COLUMN embedding BLOB")
+    file_columns = [row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()]
+    if "kept_at" not in file_columns:
+        conn.execute("ALTER TABLE files ADD COLUMN kept_at DATETIME")
     # 分類時に last_accessed_at を入れる前に登録された行を埋める
     conn.execute(
         "UPDATE files SET last_accessed_at = created_at WHERE last_accessed_at IS NULL"
@@ -296,6 +301,7 @@ def _row_to_file(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "last_accessed_at": row["last_accessed_at"],
         "status": row["status"],
+        "kept_at": row["kept_at"],
     }
 
 
@@ -376,6 +382,51 @@ def set_file_status(
     try:
         conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# T8: 放置ファイル検出
+# ---------------------------------------------------------------------------
+
+def set_kept(file_id: int, db_path: Optional[Union[str, Path]] = None) -> None:
+    """
+    片付けタイムで「残す」を選んだ日時を記録する。
+
+    last_accessed_at とは分けて持つ。「開いた」と「残すと決めた」を区別するため。
+    """
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            "UPDATE files SET kept_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), file_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_trashed(
+    file_id: int,
+    original_path: str,
+    trashed_path: str,
+    db_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """
+    ファイルをごみ箱へ入れたことを記録する。即時削除はしない（T9で元に戻せるように）。
+
+    status と退避先のパスの更新、trash_log への記録を1トランザクションにまとめる。
+    実ファイルの移動は呼び出し側（T8）の責任。
+    """
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE files SET status = 'trashed', path = ? WHERE id = ?",
+                (trashed_path, file_id),
+            )
+            insert_trash_log(file_id, original_path, "delete", conn=conn)
     finally:
         conn.close()
 
