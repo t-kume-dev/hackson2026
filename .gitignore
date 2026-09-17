@@ -2,3 +2,6 @@
 __pycache__/
 *.db
 organized/
+
+# デモ用に setup_demo.py が生成するファイル
+demo/drop/

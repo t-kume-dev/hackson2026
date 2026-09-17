@@ -66,20 +66,21 @@ EXACT_MATCH_BONUS = 0.04
 
 @dataclass
 class PeriodFilter:
-    """「先週」のような時間表現を、検出日時からの経過日数の範囲に変換したもの。"""
+    """「先週」のような時間表現を、登録日から今日までの経過日数（暦の日付の差）の範囲に変換したもの。"""
     label: str
     lo: int  # 何日前から（含む）
     hi: int  # 何日前まで（含む）
 
 
 # 期間の表現。上から順に評価し、最初に当たったものを使う。
+# 「今日」「昨日」「一昨日」は1日ぴったり。範囲に余裕を持たせると「今日」に昨日のファイルが混ざる。
 # 「先週」の幅は厳密な暦週（月曜起点）ではなく4〜11日前としている。
 # 暦どおりに切ると、水曜に「先週の資料」と言われたときに8日前の資料を取りこぼす。
 PERIOD_PATTERNS: list[tuple[re.Pattern, PeriodFilter]] = [
-    (re.compile(r"一昨日|おととい"), PeriodFilter("期間: 一昨日", 2, 3)),
-    (re.compile(r"昨日|きのう"), PeriodFilter("期間: 昨日", 1, 2)),
-    (re.compile(r"今日|きょう|さっき"), PeriodFilter("期間: 今日", 0, 1)),
-    (re.compile(r"先々週"), PeriodFilter("期間: 先々週", 11, 18)),
+    (re.compile(r"一昨日|おととい"), PeriodFilter("期間: 一昨日", 2, 2)),
+    (re.compile(r"昨日|きのう"), PeriodFilter("期間: 昨日", 1, 1)),
+    (re.compile(r"今日|きょう|さっき"), PeriodFilter("期間: 今日", 0, 0)),
+    (re.compile(r"先々週"), PeriodFilter("期間: 先々週", 12, 18)),
     (re.compile(r"先週"), PeriodFilter("期間: 先週", 4, 11)),
     (re.compile(r"今週|ここ数日|最近"), PeriodFilter("期間: 今週", 0, 7)),
     (re.compile(r"先月"), PeriodFilter("期間: 先月", 30, 60)),
@@ -175,11 +176,16 @@ def parse_query(query: str) -> ParsedQuery:
 
 
 def _days_since(created_at: Optional[str]) -> Optional[int]:
-    """created_at（ISO文字列）から今日までの経過日数。壊れていればNone。"""
+    """
+    created_at（ISO文字列）から今日までの経過日数。壊れていればNone。
+
+    24時間単位ではなく暦の日付の差で数える。24時間単位だと、昨日の夜に入れたものが
+    今朝の時点ではまだ「0日前」になり、「今日」の検索に混ざってしまう。
+    """
     if not created_at:
         return None
     try:
-        return (datetime.now() - datetime.fromisoformat(created_at)).days
+        return (datetime.now().date() - datetime.fromisoformat(created_at).date()).days
     except ValueError:
         logger.warning(f"[T7] created_atを解釈できません: {created_at}")
         return None
