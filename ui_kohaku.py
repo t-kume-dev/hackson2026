@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
 import db
 import t6_filemanager as t6
 import t7_search as t7
+import t8_cleanup as t8
 from pipeline import process_file
 from t1_watch import watch_folder
 
@@ -79,6 +81,12 @@ SPRITE_GRAY = "#a6a6a6"  # キャラのほっぺ・舌
 
 # 通知の吹き出しが消えるまでの時間。作業中に居座られるのが一番嫌われるので短く。
 TOAST_MS = 5000
+
+# 片付けタイム（T8）
+CLEANUP_BATCH = 5                          # 1回に出す候補の上限
+INVITE_FIRST_DELAY_MS = 60 * 1000          # 起動してから最初に声をかけるまで
+INVITE_INTERVAL = timedelta(hours=24)      # 声かけは1日1回まで
+INVITE_RETRY_MS = 10 * 1000                # 通知中・分類中なら少し待って出し直す
 
 # フォントは2系統に分ける。
 # - VOICE: コハクの「声」（吹き出し・ボタン・タイトル）。同梱のドット絵フォント DotGothic16。
@@ -308,6 +316,87 @@ class FileCard(QFrame):
             self.panel.say("あれ、そのファイルが見つからない。<br>外で移動か削除をされたのかも。")
 
 
+class CleanupCard(QFrame):
+    """
+    片付けタイムの候補1件。「残す」「ごみ箱へ」の二択だけを置く。
+
+    選択肢を増やすと手が止まるので、ここには他のボタンを足さない。
+    中身を確かめたいときはファイル名を押して開く。
+    """
+
+    def __init__(self, candidate: "t8.Candidate", on_decide) -> None:
+        super().__init__()
+        file = candidate.file
+        self.file = file
+        self.setStyleSheet(
+            f"QFrame#card {{ background:{SUNK}; border:0; border-radius:0px; }}"
+        )
+        self.setObjectName("card")
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+
+        badge = QLabel({"pdf": "PDF", "photo": "IMG", "text": "TXT"}.get(file["filetype"], "?"))
+        badge.setFixedSize(42, 42)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet(
+            f"background:{WHITE}; color:{BLACK}; border:0; border-radius:0px;"
+            f" font-size:13px; font-family:{VOICE};"
+        )
+        outer.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+
+        body = QVBoxLayout()
+        body.setSpacing(5)
+
+        # ファイル名はリンクにして、押すと既定アプリで開く（中身を見てから決められるように）。
+        # 開くと last_accessed_at が更新され、次回からは未アクセスの候補に出なくなる。
+        name = QLabel(f"<a href='open' style='color:{WHITE};'>{file['filename']}</a>")
+        name.setWordWrap(True)
+        name.setTextFormat(Qt.TextFormat.RichText)
+        name.setToolTip("押すと開いて中身を確かめられます")
+        name.setStyleSheet(
+            f"color:{WHITE}; font-size:13px; font-weight:600; font-family:{TEXT}; border:0;"
+        )
+        name.linkActivated.connect(lambda _: t7.open_file(file))
+        body.addWidget(name)
+
+        meta = QLabel(f"{file['category']} ・ {_human_size(file['file_size'])}")
+        meta.setStyleSheet(f"color:{DIM}; font-size:11px; font-family:{TEXT}; border:0;")
+        body.addWidget(meta)
+
+        # 候補になった理由。これを読めば判断できるように、要約より先に置く
+        reasons = QLabel(" / ".join(candidate.reasons))
+        reasons.setWordWrap(True)
+        reasons.setStyleSheet(f"color:{WHITE}; font-size:14px; font-family:{VOICE}; border:0;")
+        body.addWidget(reasons)
+
+        summary = QLabel(file["summary"])
+        summary.setWordWrap(True)
+        summary.setStyleSheet(f"color:{DIM}; font-size:12px; font-family:{TEXT}; border:0;")
+        body.addWidget(summary)
+
+        self.actions = QWidget()
+        row = QHBoxLayout(self.actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        keep_btn = _button("残す")
+        keep_btn.clicked.connect(lambda: self._decide(on_decide, "keep"))
+        row.addWidget(keep_btn)
+        trash_btn = _button("ごみ箱へ", "primary")
+        trash_btn.clicked.connect(lambda: self._decide(on_decide, "trash"))
+        row.addWidget(trash_btn)
+        row.addStretch(1)
+        body.addWidget(self.actions)
+
+        outer.addLayout(body, 1)
+
+    def _decide(self, on_decide, choice: str) -> None:
+        # 二度押しで2回処理されないよう、押した時点でボタンを消す
+        self.actions.hide()
+        on_decide(self, choice)
+
+
 # ---------------------------------------------------------------------------
 # チャットパネル
 # ---------------------------------------------------------------------------
@@ -319,6 +408,8 @@ class ChatPanel(QWidget):
         super().__init__()
         self.state = app_state
         self.threads: list[QThread] = []
+        self.greeted = False
+        self.cleanup: Optional[dict] = None   # 片付けタイムの途中経過。閉じたら None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -601,11 +692,111 @@ class ChatPanel(QWidget):
         if file is not None:
             self.add_cards([file])
 
+    # --- 片付けタイム（T8） ---------------------------------------------------
+
+    START = "はじめる"
+    LATER = "またこんど"
+    CONTINUE = "続ける"
+
+    @staticmethod
+    def invite_text(count: int) -> str:
+        return f"<b>{count}件</b> 片付けられそうなのがあるよ。<br>片付けタイムにしない？"
+
+    def offer_cleanup(self, count: int) -> None:
+        """声かけを会話ログに残す。吹き出しが消えた後でも、ここから始められる。"""
+        self.say(self.invite_text(count))
+        self.add_chips([self.START, self.LATER], self._answer_invite)
+
+    def _answer_invite(self, answer: str) -> None:
+        if answer in (self.START, self.CONTINUE):
+            self.start_cleanup()
+        else:
+            self.say("じゃあ、またこんどね。")
+
+    def invite_from_menu(self) -> None:
+        """右クリックメニューから。声かけを経ていないので、まず誘うところから。"""
+        self.show_panel()
+        candidates = t8.find_candidates()
+        if not candidates:
+            self.say("いまは片付けるものは無いよ。えらい。")
+            return
+        self.offer_cleanup(len(candidates))
+
+    def start_cleanup(self) -> None:
+        # 誘いに応じた流れの途中なので、「おかえり」の挨拶は挟まない
+        self.show_panel(greet=False)
+        # 声かけから時間がたっているかもしれないので、押した時点で算出し直す
+        candidates = t8.find_candidates()
+        if not candidates:
+            self.say("いまは片付けるものは無いよ。えらい。")
+            return
+        self.cleanup = {"queue": candidates, "shown": 0, "trashed": 0, "kept": 0, "size": 0}
+        self.say("よし、1件ずつ見ていこう。<br>「残す」か「ごみ箱へ」で答えてね。")
+        self._next_candidate()
+
+    def _next_candidate(self) -> None:
+        session = self.cleanup
+        if session is None:
+            return
+        if not session["queue"] or session["shown"] >= CLEANUP_BATCH:
+            self._finish_cleanup()
+            return
+        candidate = session["queue"].pop(0)
+        session["shown"] += 1
+        self._append_wide(
+            CleanupCard(
+                candidate,
+                lambda card, choice, s=session: self._decide_cleanup(s, card, choice),
+            )
+        )
+
+    def _decide_cleanup(self, session: dict, card: CleanupCard, choice: str) -> None:
+        # パネルを閉じて終わった回のカードが後から押されても、処理しない
+        if session is not self.cleanup:
+            self.say("この回はもう終わってるよ。<br>右クリックの「片付けタイム」からまた始めてね。")
+            return
+        file = card.file
+        if choice == "keep":
+            t8.keep_file(file["id"])
+            session["kept"] += 1
+            self.say(f"{file['filename']} は残しておくね。<br>しばらくは聞かないよ。")
+        elif t8.trash_file(file["id"]) is None:
+            self.say("あれ、そのファイルが見つからない。<br>外で移動か削除をされたのかも。")
+        else:
+            session["trashed"] += 1
+            session["size"] += file["file_size"]
+            self.say(f"{file['filename']} をごみ箱へ入れたよ。")
+        self._next_candidate()
+
+    def _finish_cleanup(self) -> None:
+        session = self.cleanup
+        self.cleanup = None
+        if session is None:
+            return
+        parts = []
+        if session["trashed"]:
+            parts.append(f"ごみ箱へ {session['trashed']}件")
+        if session["kept"]:
+            parts.append(f"残す {session['kept']}件")
+        text = "おつかれさま。"
+        if parts:
+            text += f"<br><b>{' / '.join(parts)}</b>"
+        if session["trashed"]:
+            text += f"<br>{_human_size(session['size'])} 片付いた。"
+        self.say(text)
+
+        rest = len(session["queue"])
+        if rest:
+            self.say(f"まだ <b>{rest}件</b> あるよ。続ける？")
+            self.add_chips([self.CONTINUE, self.LATER], self._answer_invite)
+
     # --- 表示制御 -----------------------------------------------------------
 
     def greet_if_empty(self) -> None:
-        if self.log.count() > 1:
+        # ログの件数で判定すると、パネルを開く前に流れた声かけや通知で挨拶が飛ぶ
+        if self.greeted:
             return
+        self.greeted = True
         files = db.get_active_files()
         if files:
             categories = sorted({f["category"] for f in files})[:3]
@@ -619,17 +810,20 @@ class ChatPanel(QWidget):
             ["先週の資料", "契約書どこだっけ", "今日入れたやつ"], self.ask
         )
 
-    def show_panel(self) -> None:
+    def show_panel(self, greet: bool = True) -> None:
         self.state.hide_toast()
         self.move(self.state.panel_position())
         self.show()
         self.raise_()
         self.activateWindow()
-        self.greet_if_empty()
+        if greet:
+            self.greet_if_empty()
         self.input.setFocus()
         self.state.mascot.hide()
 
     def hide_panel(self) -> None:
+        # 片付けタイムは途中で閉じたらその回は終わり（次に開いても続きからは再開しない）
+        self.cleanup = None
         self.hide()
         self.state.mascot.show()
         self.state.mascot.ensure_on_top()
@@ -1039,6 +1233,10 @@ class Kohaku:
         self.watcher.failed.connect(self._on_failed)
         self.watcher.start()
 
+        # 片付けタイムの声かけ。起動直後は作業の邪魔なので少し待ってから
+        self.last_invite: Optional[datetime] = None
+        QTimer.singleShot(INVITE_FIRST_DELAY_MS, self.maybe_invite_cleanup)
+
     def _place_mascot(self) -> None:
         """画面左下に置く。タスクバーを避けるため作業領域を基準にする。"""
         screen = self.app.primaryScreen().availableGeometry()
@@ -1072,6 +1270,9 @@ class Kohaku:
         open_action = QAction("コハクと話す", menu)
         open_action.triggered.connect(self.panel.show_panel)
         menu.addAction(open_action)
+        tidy_action = QAction("片付けタイム", menu)
+        tidy_action.triggered.connect(self.panel.invite_from_menu)
+        menu.addAction(tidy_action)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
@@ -1087,6 +1288,9 @@ class Kohaku:
         talk = QAction("コハクと話す", menu)
         talk.triggered.connect(self.panel.show_panel)
         menu.addAction(talk)
+        tidy = QAction("片付けタイム", menu)
+        tidy.triggered.connect(self.panel.invite_from_menu)
+        menu.addAction(tidy)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
@@ -1127,6 +1331,44 @@ class Kohaku:
             ],
             self.toast_position(),
         )
+        # 前回の声かけから1日たっていれば、分類の通知が消えた後に誘う
+        self.maybe_invite_cleanup()
+
+    # --- 片付けタイムの声かけ ------------------------------------------------
+
+    def maybe_invite_cleanup(self) -> None:
+        """
+        候補があれば吹き出しで片付けタイムに誘う。1日1回まで。
+
+        ダウンロードの通知と重なると両方読まれなくなるので、通知中・分類中は待つ。
+        """
+        if self.last_invite is not None and datetime.now() - self.last_invite < INVITE_INTERVAL:
+            return
+        if self.toast.isVisible() or self.mascot.working:
+            QTimer.singleShot(INVITE_RETRY_MS, self.maybe_invite_cleanup)
+            return
+
+        candidates = t8.find_candidates()
+        if not candidates:
+            return
+        # 「またこんど」を押しても、吹き出しが消えただけでも、次は24時間後
+        self.last_invite = datetime.now()
+
+        self.panel.offer_cleanup(len(candidates))
+        if self.panel.isVisible():
+            return
+        self.toast.show_message(
+            ChatPanel.invite_text(len(candidates)),
+            [
+                (ChatPanel.START, "primary", self._start_cleanup_from_toast),
+                (ChatPanel.LATER, "plain", self.hide_toast),
+            ],
+            self.toast_position(),
+        )
+
+    def _start_cleanup_from_toast(self) -> None:
+        self.hide_toast()
+        self.panel.start_cleanup()
 
     def _open_from_toast(self, file_id: int) -> None:
         self.hide_toast()
