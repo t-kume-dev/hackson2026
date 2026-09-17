@@ -243,7 +243,7 @@ class Bubble(QFrame):
 
 
 class FileCard(QFrame):
-    """ファイル1件のカード。開く / 別のカテゴリへ / 場所を表示。"""
+    """ファイル1件のカード。開く / 別のカテゴリへ / 場所を表示 と、右上に「ごみ箱へ」。"""
 
     def __init__(self, file: dict, panel: "ChatPanel") -> None:
         super().__init__()
@@ -276,7 +276,22 @@ class FileCard(QFrame):
         name.setStyleSheet(
             f"color:{WHITE}; font-size:13px; font-weight:600; font-family:{TEXT}; border:0;"
         )
-        body.addWidget(name)
+        # T9: ごみ箱へは下のボタン列に並べず、ファイル名の右に小さく置く。
+        # 4つ並べるとパネルの幅からはみ出すうえ、「開く」の隣に消す操作があると押し間違える。
+        # 即時削除ではなく .trash へ入れるだけなので、間違えても「元に戻す」で戻せる。
+        delete_btn = QPushButton("ごみ箱へ")
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:{DIM}; border:0; padding:0 2px;"
+            f" font-size:12px; font-family:{TEXT}; text-decoration:underline; }}"
+            f"QPushButton:hover {{ color:{WHITE}; }}"
+        )
+        delete_btn.clicked.connect(lambda: panel.delete_file(file["id"], self))
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title_row.addWidget(name, 1)
+        title_row.addWidget(delete_btn, 0, Qt.AlignmentFlag.AlignTop)
+        body.addLayout(title_row)
 
         meta = QLabel(f"{file['category']} ・ {_human_size(file['file_size'])}")
         meta.setStyleSheet(f"color:{DIM}; font-size:11px; font-family:{TEXT}; border:0;")
@@ -302,11 +317,6 @@ class FileCard(QFrame):
         reveal_btn = _button("場所を表示")
         reveal_btn.clicked.connect(lambda: t7.reveal_file(file))
         actions.addWidget(reveal_btn)
-        # T9: 検索結果のカードからも削除できるようにする。
-        # 即時削除ではなくごみ箱(.trash)へ入れるだけなので、間違えても「元に戻す」で戻せる。
-        delete_btn = _button("削除")
-        delete_btn.clicked.connect(lambda: panel.delete_file(file["id"], self))
-        actions.addWidget(delete_btn)
         actions.addStretch(1)
         body.addLayout(actions)
 
