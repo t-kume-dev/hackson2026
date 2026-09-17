@@ -49,7 +49,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "gemini-3.6-flash"  # 無料枠対象（1日20回まで）
-OPENAI_MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+OPENAI_MODEL_NAME = os.environ.get("OPENAI_MODEL", "gpt-5.5")
 
 
 def _provider() -> str:
