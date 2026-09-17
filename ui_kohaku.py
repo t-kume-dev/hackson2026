@@ -64,6 +64,7 @@ import db
 import t6_filemanager as t6
 import t7_search as t7
 import t8_cleanup as t8
+import t9_undo
 from pipeline import process_file
 from t1_watch import watch_folder
 
@@ -298,6 +299,11 @@ class FileCard(QFrame):
         reveal_btn = _button("場所を表示")
         reveal_btn.clicked.connect(lambda: t7.reveal_file(file))
         actions.addWidget(reveal_btn)
+        # T9: 検索結果のカードからも削除できるようにする。
+        # 即時削除ではなくごみ箱(.trash)へ入れるだけなので、間違えても「元に戻す」で戻せる。
+        delete_btn = _button("削除")
+        delete_btn.clicked.connect(lambda: panel.delete_file(file["id"], self))
+        actions.addWidget(delete_btn)
         actions.addStretch(1)
         body.addLayout(actions)
 
@@ -692,6 +698,49 @@ class ChatPanel(QWidget):
         if file is not None:
             self.add_cards([file])
 
+        # --- 削除・Undo（T9） -----------------------------------------------------
+
+    def delete_file(self, file_id: int, card: Optional[QWidget] = None) -> None:
+        """
+        検索結果のカードから「削除」を選んだときに呼ばれる。
+        即時削除ではなく、T8と同じ trash_file() でごみ箱(.trash)へ移すだけなので
+        間違えてもすぐ「元に戻す」で復元できる。
+        """
+        file = db.get_file(file_id)
+        if file is None:
+            self.say("あれ、そのファイルが見当たらない。")
+            return
+
+        destination = t8.trash_file(file_id)
+        if destination is None:
+            self.say("削除できなかった。<br>外で移動されたか、既にごみ箱に入っているのかも。")
+            return
+
+        if card is not None:
+            card.setParent(None)
+            card.deleteLater()
+
+        self.say(f"<b>{file['filename']}</b> をごみ箱へ入れたよ。")
+        self.add_chips(["元に戻す"], lambda _: self.undo_last_action())
+
+    def undo_last_action(self) -> None:
+        """直前の移動・削除を1件取り消す（T9）。"""
+        result = t9_undo.undo_last_action()
+        if result is None:
+            self.say("元に戻せる操作は無いよ。")
+            return
+
+        file = db.get_file(result["file_id"])
+        name = file["filename"] if file else Path(result["original_path"]).name
+        label = "削除" if result["action_type"] == "delete" else "移動"
+        self.say(f"<b>{name}</b> の{label}を取り消したよ。")
+        if file is not None:
+            self.add_cards([file])
+
+    def undo_from_menu(self) -> None:
+        """右クリックメニュー・トレイメニューの「元に戻す」から呼ばれる。"""
+        self.show_panel(greet=False)
+        self.undo_last_action()
     # --- 片付けタイム（T8） ---------------------------------------------------
 
     START = "はじめる"
@@ -1273,6 +1322,9 @@ class Kohaku:
         tidy_action = QAction("片付けタイム", menu)
         tidy_action.triggered.connect(self.panel.invite_from_menu)
         menu.addAction(tidy_action)
+        undo_action = QAction("元に戻す", menu)
+        undo_action.triggered.connect(self.panel.undo_from_menu)
+        menu.addAction(undo_action)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
@@ -1291,6 +1343,9 @@ class Kohaku:
         tidy = QAction("片付けタイム", menu)
         tidy.triggered.connect(self.panel.invite_from_menu)
         menu.addAction(tidy)
+        undo = QAction("元に戻す", menu)
+        undo.triggered.connect(self.panel.undo_from_menu)
+        menu.addAction(undo)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
