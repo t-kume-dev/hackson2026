@@ -28,6 +28,7 @@ Signal になる点だけ違う。
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,8 @@ import db
 import t6_filemanager as t6
 import t7_search as t7
 import t8_cleanup as t8
+from t4_classify import CATEGORY_SEPARATOR, MAX_CATEGORY_DEPTH
+from t5_dedupe import resolve_category
 from pipeline import process_file
 from t1_watch import watch_folder
 
@@ -590,6 +593,22 @@ class ChatPanel(QWidget):
         row.addStretch(1)
         self._append_wide(holder)
 
+    def add_choices(self, labels: list[str], on_click) -> None:
+        """
+        縦に並べる選択肢。カテゴリの階層名（「経理／経費精算／出張精算」）は長いので、
+        横並びのチップだと画面からはみ出す。
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+        for label in labels:
+            choice = _button(label)
+            choice.setStyleSheet(choice.styleSheet() + "QPushButton { text-align: left; }")
+            choice.clicked.connect(lambda _, v=label: on_click(v))
+            column.addWidget(choice)
+        self._append_wide(holder)
+
     def add_cards(self, files: list[dict]) -> None:
         holder = QWidget()
         column = QVBoxLayout(holder)
@@ -663,29 +682,53 @@ class ChatPanel(QWidget):
         self.say(f"いまは「{current_category}」に入れてあるよ。<br>どこに入れ直す？")
 
         candidates = t7.suggest_categories(file_id)
-        self.add_chips(
+        self.add_choices(
             candidates + [self.NEW_CATEGORY],
             lambda name: self._pick_category(file_id, name),
         )
 
+    TOP_LEVEL = "いちばん上に作る"
+
     def _pick_category(self, file_id: int, category: str) -> None:
         if category == self.NEW_CATEGORY:
-            name, ok = QInputDialog.getText(self, "新しいカテゴリ", "カテゴリ名を入れてください")
-            name = name.strip() if ok else ""
-            if not name:
-                self.say("そのままにしておくね。")
-                return
-            category = name
+            # 階層のどこに作るかを先に選んでもらう。最下層の下には作れない。
+            parents = sorted(
+                name for name in db.get_category_names()
+                if len(name.split(CATEGORY_SEPARATOR)) < MAX_CATEGORY_DEPTH
+            )
+            self.say("どこの中に作る？")
+            self.add_choices(
+                [self.TOP_LEVEL] + parents,
+                lambda parent: self._create_category(file_id, parent),
+            )
+            return
+        self._move_to(file_id, category)
 
+    def _create_category(self, file_id: int, parent: str) -> None:
+        prefix = "" if parent == self.TOP_LEVEL else parent + CATEGORY_SEPARATOR
+        name, ok = QInputDialog.getText(
+            self, "新しいカテゴリ",
+            f"{prefix or '（いちばん上）'} の中に作るカテゴリ名\n"
+            "「/」で区切ると、さらに下の階層までまとめて作れます",
+        )
+        # 「/」「>」でも階層を区切れるようにする（全角の区切り文字は打ちにくい）
+        parts = [p.strip() for p in re.split(r"[/／>＞]", name if ok else "") if p.strip()]
+        if not parts:
+            self.say("そのままにしておくね。")
+            return
+        full = prefix + CATEGORY_SEPARATOR.join(parts)
+        if len(full.split(CATEGORY_SEPARATOR)) > MAX_CATEGORY_DEPTH:
+            self.say(f"階層は{MAX_CATEGORY_DEPTH}段までにしてね。")
+            return
+        # 途中の階層も含めて categories に登録し、既存と表記が揺れていれば揃える。
+        # 登録しないと、次の分類でT4のプロンプトに候補として出てこない。
+        self._move_to(file_id, resolve_category(full))
+
+    def _move_to(self, file_id: int, category: str) -> None:
         moved = t6.recategorize(file_id, category)
         if not moved:
             self.say("移せなかった。ファイルが見当たらない。")
             return
-
-        # 新しいカテゴリは categories テーブルにも登録しておく。
-        # ここを忘れると、次の分類でT4のプロンプトに候補として出てこない。
-        if category not in db.get_category_names():
-            db.insert_category(category)
 
         self.say(f"「{category}」に移したよ。")
         file = db.get_file(file_id)
@@ -1278,6 +1321,9 @@ class Kohaku:
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
 
+        # キャラに被さって隠れないよう、開いている間は最前面への押し上げを止める（show_menu と同じ）
+        menu.aboutToShow.connect(self.mascot.topmost_timer.stop)
+        menu.aboutToHide.connect(self.mascot.topmost_timer.start)
         tray.setContextMenu(menu)
         tray.activated.connect(lambda _: self.panel.show_panel())
         tray.show()
@@ -1295,7 +1341,13 @@ class Kohaku:
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
-        menu.exec(at)
+        # キャラは定期的に最前面へ押し上げているので、そのままだとメニューの上に被さって
+        # 項目が押せなくなる。開いている間だけ止める。
+        self.mascot.topmost_timer.stop()
+        try:
+            menu.exec(at)
+        finally:
+            self.mascot.topmost_timer.start()
 
     # --- 監視スレッドからの通知 ---------------------------------------------
 
