@@ -14,6 +14,7 @@ SQLite DB層（T5・T6・T7以降が共通で使う「外側の箱」）
 - insert_file() / insert_trash_log()                 : T6（ファイル移動＋DB保存）が使う
 - get_active_files() / get_file() / touch_file()
   / update_file_location() / set_file_status()       : T7（意味検索・ファイル操作）が使う
+- get_trash_logs() / restore_file()                 : T9（ゴミ箱・Undo）が使う
 
 embeddingはnumpy配列（float32）としてやり取りし、DBにはBLOBとして保存する。
 categories.embedding だけはNULLを許容する（T5がembedding API呼び出しに失敗したとき、
@@ -427,6 +428,52 @@ def mark_trashed(
                 (trashed_path, file_id),
             )
             insert_trash_log(file_id, original_path, "delete", conn=conn)
+    finally:
+        conn.close()
+
+
+
+# ---------------------------------------------------------------------------
+# T9: ゴミ箱・Undo
+# ---------------------------------------------------------------------------
+
+def get_trash_logs(
+    file_id: Optional[int] = None,
+    db_path: Optional[Union[str, Path]] = None,
+) -> list[dict]:
+    """trash_log を新しい順に返す。file_id を渡すとそのファイルの記録だけ。"""
+    sql = "SELECT * FROM trash_log"
+    params: tuple = ()
+    if file_id is not None:
+        sql += " WHERE file_id = ?"
+        params = (file_id,)
+    conn = get_connection(db_path)
+    try:
+        rows = conn.execute(sql + " ORDER BY acted_at DESC, id DESC", params).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def restore_file(
+    file_id: int,
+    path: str,
+    category: str,
+    log_id: int,
+    db_path: Optional[Union[str, Path]] = None,
+) -> None:
+    """
+    移動・削除を取り消したことを記録する。
+    files を元の場所・カテゴリ・active に戻し、取り消した trash_log の行を消す（1トランザクション）。
+    """
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE files SET path = ?, filename = ?, category = ?, status = 'active' WHERE id = ?",
+                (path, Path(path).name, category, file_id),
+            )
+            conn.execute("DELETE FROM trash_log WHERE id = ?", (log_id,))
     finally:
         conn.close()
 

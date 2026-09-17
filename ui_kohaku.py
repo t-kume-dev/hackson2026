@@ -1,5 +1,5 @@
 """
-コハク: デスクトップ常駐の相棒UI（PySide6）
+MOFU: デスクトップ常駐の相棒UI（PySide6）
 
 デスクトップの隅にキャラが浮かんでいて、
 - ダウンロードを検出したら吹き出しで「どこに入れたか」を知らせる（自発）
@@ -28,6 +28,7 @@ Signal になる点だけ違う。
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,6 +65,9 @@ import db
 import t6_filemanager as t6
 import t7_search as t7
 import t8_cleanup as t8
+import t9_undo
+from t4_classify import CATEGORY_SEPARATOR, MAX_CATEGORY_DEPTH
+from t5_dedupe import resolve_category
 from pipeline import process_file
 from t1_watch import watch_folder
 
@@ -89,7 +93,7 @@ INVITE_INTERVAL = timedelta(hours=24)      # 声かけは1日1回まで
 INVITE_RETRY_MS = 10 * 1000                # 通知中・分類中なら少し待って出し直す
 
 # フォントは2系統に分ける。
-# - VOICE: コハクの「声」（吹き出し・ボタン・タイトル）。同梱のドット絵フォント DotGothic16。
+# - VOICE: MOFUの「声」（吹き出し・ボタン・タイトル）。同梱のドット絵フォント DotGothic16。
 #   16px基準のフォントなので、それより小さくすると潰れて読めなくなる。14px以上で使う。
 # - TEXT: ファイル名・要約など情報量の多い部分。小さくても読める普通のUIフォント。
 #   全部ドット絵フォントにすると、世界観は揃うが実用に耐えない（実際に見づらかった）。
@@ -205,8 +209,8 @@ class Bubble(QFrame):
 
     def __init__(self, text: str, mine: bool = False) -> None:
         super().__init__()
-        # コハクの発言は黒地に白枠（指定どおり）、自分の発言は枠なしの白地。
-        # 白枠を持つのはコハクの吹き出しだけにして、会話の主役を分かりやすくする。
+        # MOFUの発言は黒地に白枠（指定どおり）、自分の発言は枠なしの白地。
+        # 白枠を持つのはMOFUの吹き出しだけにして、会話の主役を分かりやすくする。
         if mine:
             frame = f"background:{WHITE}; border:0;"
             fg = BLACK
@@ -239,7 +243,7 @@ class Bubble(QFrame):
 
 
 class FileCard(QFrame):
-    """ファイル1件のカード。開く / 別のカテゴリへ / 場所を表示。"""
+    """ファイル1件のカード。開く / 別のカテゴリへ / 場所を表示 と、右上に「ごみ箱へ」。"""
 
     def __init__(self, file: dict, panel: "ChatPanel") -> None:
         super().__init__()
@@ -272,7 +276,22 @@ class FileCard(QFrame):
         name.setStyleSheet(
             f"color:{WHITE}; font-size:13px; font-weight:600; font-family:{TEXT}; border:0;"
         )
-        body.addWidget(name)
+        # T9: ごみ箱へは下のボタン列に並べず、ファイル名の右に小さく置く。
+        # 4つ並べるとパネルの幅からはみ出すうえ、「開く」の隣に消す操作があると押し間違える。
+        # 即時削除ではなく .trash へ入れるだけなので、間違えても「元に戻す」で戻せる。
+        delete_btn = QPushButton("ごみ箱へ")
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:{DIM}; border:0; padding:0 2px;"
+            f" font-size:12px; font-family:{TEXT}; text-decoration:underline; }}"
+            f"QPushButton:hover {{ color:{WHITE}; }}"
+        )
+        delete_btn.clicked.connect(lambda: panel.delete_file(file["id"], self))
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title_row.addWidget(name, 1)
+        title_row.addWidget(delete_btn, 0, Qt.AlignmentFlag.AlignTop)
+        body.addLayout(title_row)
 
         meta = QLabel(f"{file['category']} ・ {_human_size(file['file_size'])}")
         meta.setStyleSheet(f"color:{DIM}; font-size:11px; font-family:{TEXT}; border:0;")
@@ -478,7 +497,7 @@ class ChatPanel(QWidget):
         row = QHBoxLayout(header)
         row.setContentsMargins(16, 12, 12, 12)
 
-        title = QLabel("コハク")
+        title = QLabel("MOFU")
         title.setStyleSheet(f"color:{WHITE}; font-size:18px; font-family:{VOICE};")
         row.addWidget(title)
 
@@ -572,7 +591,7 @@ class ChatPanel(QWidget):
         self._follow = value >= bar.maximum() - 8
 
     def say(self, text: str) -> Bubble:
-        """コハク側の発言。"""
+        """MOFU側の発言。"""
         return self._append(Bubble(text))
 
     def say_user(self, text: str) -> Bubble:
@@ -588,6 +607,22 @@ class ChatPanel(QWidget):
             chip.clicked.connect(lambda _, v=label: on_click(v))
             row.addWidget(chip)
         row.addStretch(1)
+        self._append_wide(holder)
+
+    def add_choices(self, labels: list[str], on_click) -> None:
+        """
+        縦に並べる選択肢。カテゴリの階層名（「経理／経費精算／出張精算」）は長いので、
+        横並びのチップだと画面からはみ出す。
+        """
+        holder = QWidget()
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+        for label in labels:
+            choice = _button(label)
+            choice.setStyleSheet(choice.styleSheet() + "QPushButton { text-align: left; }")
+            choice.clicked.connect(lambda _, v=label: on_click(v))
+            column.addWidget(choice)
         self._append_wide(holder)
 
     def add_cards(self, files: list[dict]) -> None:
@@ -663,34 +698,106 @@ class ChatPanel(QWidget):
         self.say(f"いまは「{current_category}」に入れてあるよ。<br>どこに入れ直す？")
 
         candidates = t7.suggest_categories(file_id)
-        self.add_chips(
+        self.add_choices(
             candidates + [self.NEW_CATEGORY],
             lambda name: self._pick_category(file_id, name),
         )
 
+    TOP_LEVEL = "いちばん上に作る"
+
     def _pick_category(self, file_id: int, category: str) -> None:
         if category == self.NEW_CATEGORY:
-            name, ok = QInputDialog.getText(self, "新しいカテゴリ", "カテゴリ名を入れてください")
-            name = name.strip() if ok else ""
-            if not name:
-                self.say("そのままにしておくね。")
-                return
-            category = name
+            # 階層のどこに作るかを先に選んでもらう。最下層の下には作れない。
+            parents = sorted(
+                name for name in db.get_category_names()
+                if len(name.split(CATEGORY_SEPARATOR)) < MAX_CATEGORY_DEPTH
+            )
+            self.say("どこの中に作る？")
+            self.add_choices(
+                [self.TOP_LEVEL] + parents,
+                lambda parent: self._create_category(file_id, parent),
+            )
+            return
+        self._move_to(file_id, category)
 
+    def _create_category(self, file_id: int, parent: str) -> None:
+        prefix = "" if parent == self.TOP_LEVEL else parent + CATEGORY_SEPARATOR
+        name, ok = QInputDialog.getText(
+            self, "新しいカテゴリ",
+            f"{prefix or '（いちばん上）'} の中に作るカテゴリ名\n"
+            "「/」で区切ると、さらに下の階層までまとめて作れます",
+        )
+        # 「/」「>」でも階層を区切れるようにする（全角の区切り文字は打ちにくい）
+        parts = [p.strip() for p in re.split(r"[/／>＞]", name if ok else "") if p.strip()]
+        if not parts:
+            self.say("そのままにしておくね。")
+            return
+        full = prefix + CATEGORY_SEPARATOR.join(parts)
+        if len(full.split(CATEGORY_SEPARATOR)) > MAX_CATEGORY_DEPTH:
+            self.say(f"階層は{MAX_CATEGORY_DEPTH}段までにしてね。")
+            return
+        # 途中の階層も含めて categories に登録し、既存と表記が揺れていれば揃える。
+        # 登録しないと、次の分類でT4のプロンプトに候補として出てこない。
+        self._move_to(file_id, resolve_category(full))
+
+    def _move_to(self, file_id: int, category: str) -> None:
         moved = t6.recategorize(file_id, category)
         if not moved:
             self.say("移せなかった。ファイルが見当たらない。")
             return
 
-        # 新しいカテゴリは categories テーブルにも登録しておく。
-        # ここを忘れると、次の分類でT4のプロンプトに候補として出てこない。
-        if category not in db.get_category_names():
-            db.insert_category(category)
-
         self.say(f"「{category}」に移したよ。")
         file = db.get_file(file_id)
         if file is not None:
             self.add_cards([file])
+        self.add_chips([self.UNDO], lambda _: self.undo_last_action(file_id))
+
+    # --- 削除・Undo（T9） -----------------------------------------------------
+
+    UNDO = "元に戻す"
+
+    def delete_file(self, file_id: int, card: Optional[QWidget] = None) -> None:
+        """
+        検索結果のカードから「削除」を選んだときに呼ばれる。
+        即時削除ではなく、T8と同じ trash_file() でごみ箱(.trash)へ移すだけなので
+        間違えてもすぐ「元に戻す」で復元できる。
+        """
+        file = db.get_file(file_id)
+        if file is None:
+            self.say("あれ、そのファイルが見当たらない。")
+            return
+
+        destination = t8.trash_file(file_id)
+        if destination is None:
+            self.say("削除できなかった。<br>外で移動されたか、既にごみ箱に入っているのかも。")
+            return
+
+        if card is not None:
+            card.setParent(None)
+            card.deleteLater()
+
+        self.say(f"<b>{file['filename']}</b> をごみ箱へ入れたよ。")
+        # 間に別のダウンロードが分類されても、このファイルの削除だけを戻す
+        self.add_chips([self.UNDO], lambda _: self.undo_last_action(file_id))
+
+    def undo_last_action(self, file_id: Optional[int] = None) -> None:
+        """直前の移動・削除を1件取り消す（T9）。file_id を渡すとそのファイルの操作に限る。"""
+        result = t9_undo.undo_last_action(file_id)
+        if result is None:
+            self.say("元に戻せる操作は無いよ。")
+            return
+
+        file = db.get_file(result["file_id"])
+        name = file["filename"] if file else Path(result["original_path"]).name
+        label = "削除" if result["action_type"] == "delete" else "移動"
+        self.say(f"<b>{name}</b> の{label}を取り消したよ。")
+        if file is not None:
+            self.add_cards([file])
+
+    def undo_from_menu(self) -> None:
+        """右クリックメニュー・トレイメニューの「元に戻す」から呼ばれる。"""
+        self.show_panel(greet=False)
+        self.undo_last_action()
 
     # --- 片付けタイム（T8） ---------------------------------------------------
 
@@ -1264,20 +1371,26 @@ class Kohaku:
         _draw_sprite(painter, SPRITE_IDLE, -2, 0, 2)
         painter.end()
         tray = QSystemTrayIcon(QIcon(pixmap))
-        tray.setToolTip("コハク")
+        tray.setToolTip("MOFU")
 
         menu = QMenu()
-        open_action = QAction("コハクと話す", menu)
+        open_action = QAction("MOFUと話す", menu)
         open_action.triggered.connect(self.panel.show_panel)
         menu.addAction(open_action)
         tidy_action = QAction("片付けタイム", menu)
         tidy_action.triggered.connect(self.panel.invite_from_menu)
         menu.addAction(tidy_action)
+        undo_action = QAction("元に戻す", menu)
+        undo_action.triggered.connect(self.panel.undo_from_menu)
+        menu.addAction(undo_action)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
 
+        # キャラに被さって隠れないよう、開いている間は最前面への押し上げを止める（show_menu と同じ）
+        menu.aboutToShow.connect(self.mascot.topmost_timer.stop)
+        menu.aboutToHide.connect(self.mascot.topmost_timer.start)
         tray.setContextMenu(menu)
         tray.activated.connect(lambda _: self.panel.show_panel())
         tray.show()
@@ -1285,17 +1398,26 @@ class Kohaku:
 
     def show_menu(self, at: QPoint) -> None:
         menu = QMenu()
-        talk = QAction("コハクと話す", menu)
+        talk = QAction("MOFUと話す", menu)
         talk.triggered.connect(self.panel.show_panel)
         menu.addAction(talk)
         tidy = QAction("片付けタイム", menu)
         tidy.triggered.connect(self.panel.invite_from_menu)
         menu.addAction(tidy)
+        undo = QAction("元に戻す", menu)
+        undo.triggered.connect(self.panel.undo_from_menu)
+        menu.addAction(undo)
         menu.addSeparator()
         quit_action = QAction("終了", menu)
         quit_action.triggered.connect(self.app.quit)
         menu.addAction(quit_action)
-        menu.exec(at)
+        # キャラは定期的に最前面へ押し上げているので、そのままだとメニューの上に被さって
+        # 項目が押せなくなる。開いている間だけ止める。
+        self.mascot.topmost_timer.stop()
+        try:
+            menu.exec(at)
+        finally:
+            self.mascot.topmost_timer.start()
 
     # --- 監視スレッドからの通知 ---------------------------------------------
 
@@ -1393,12 +1515,12 @@ def run(watch_dir: str) -> int:
     app.setQuitOnLastWindowClosed(False)  # パネルを閉じても常駐を続ける
     _load_pixel_font()
     app.setFont(QFont("DotGothic16", 10))
-    app.setApplicationName("コハク")
+    app.setApplicationName("MOFU")
 
     Kohaku(app, watch_dir)
 
-    print(f"[コハク] 監視開始: {watch_dir}")
-    print("[コハク] 左下のキャラをクリックすると話せます。終了はキャラを右クリック。")
+    print(f"[MOFU] 監視開始: {watch_dir}")
+    print("[MOFU] 左下のキャラをクリックすると話せます。終了はキャラを右クリック。")
 
     return app.exec()
 

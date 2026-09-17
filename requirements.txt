@@ -8,3 +8,4 @@ Pillow
 numpy
 sentence-transformers
 PySide6
+openai
