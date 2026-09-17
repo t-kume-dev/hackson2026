@@ -93,7 +93,7 @@ python main.py <フォルダ> --console  # UIなし。どの段で止まった�
 | photo | ポケモン | n812.png | |
 | photo | ポケモン | n812_1.png | 同名ファイルを2回入れたもの |
 | text | 経費精算書 | sample.txt | |
-| photo | ドット絵イラスト | n812.png | 開いた記録あり（`last_accessed_at` が入っている） |
+| photo | ドット絵イラスト | n812.png | 開いた記録あり（`last_accessed_at` が `created_at` より新しい） |
 
 同じ画像が3回入っているので、**T8の重複検出の確認材料にそのまま使えます。**
 不要なら `omakase.db` と `organized/` を消せば空から始められます。
@@ -168,8 +168,9 @@ T8の放置ファイル提案、T9のUndoも、このログにメッセージと
 - テーブルは仕様書8章どおり `files` / `categories` / `trash_log` の3つ
 - `categories.embedding` はNULL許容（T5がAPI失敗時に名前だけ先に登録するため）
 - T6はfilesとtrash_logのINSERTを1トランザクションにまとめています
-- `files.last_accessed_at` は**アプリ経由で開いたときだけ**記録されます（`t7_search.open_file()`）。
-  T8の「未アクセス期間」はこれを一次情報にし、無ければmtimeで代用する（仕様書6.5）
+- `files.last_accessed_at` は**分類した時点**で `created_at` と同じ値が入り、
+  以降は**アプリ経由で開いたとき**に更新されます（`t7_search.open_file()`）。
+  T8の「未アクセス期間」はこの列だけを見ればよい。`last_accessed_at == created_at` なら一度も開かれていない（仕様書6.5）
 
 T7で足した関数: `get_active_files()` / `get_file()` / `touch_file()` /
 `update_file_location()` / `set_file_status()`（T9で使う想定）
@@ -193,7 +194,7 @@ e5系に必須のプレフィックス（`passage:` / `query:`）と正規化を
 
 仕様書6.5のとおり、**常時監視ではなくオンデマンド計算**です。
 
-- 判定材料: 未アクセス期間（`last_accessed_at`、無ければmtime）＋重複（`files.hash` 完全一致）＋ファイルサイズ
+- 判定材料: 未アクセス期間（`last_accessed_at`）＋重複（`files.hash` 完全一致）＋ファイルサイズ
 - UIは会話ログに流す。相談時の案は「**片付けタイム**」：
   コハクが「5分だけいい？」と誘い、候補を1件ずつカードで出して **「残す」「ごみ箱へ」の二択** で捌かせる。
   判断理由（何ヶ月開いてない・重複・サイズ）をカード内に書く。終わったら褒める

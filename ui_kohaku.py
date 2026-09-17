@@ -9,7 +9,7 @@
 【設計の前提】
 - ファイルビューアは自前で持たない。「開く」はOSの既定アプリに投げるだけ
   （エクスプローラーでダブルクリックしたのと同じ挙動）。
-  この導線を通ったときだけ last_accessed_at が記録され、放置検出の根拠になる。
+  この導線を通ったときに last_accessed_at が更新され、放置検出の根拠になる。
 - 分類は必ず外れるので、通知から直接カテゴリを訂正できるようにしている。
 - 重い処理（分類パイプライン・embedding生成）はUIスレッドで走らせない。
   画面が固まると常駐アプリとしては致命的なので、全てワーカースレッドに逃がす。
@@ -894,13 +894,27 @@ class Mascot(QWidget):
         if sys.platform == "win32":
             try:
                 import ctypes
+                from ctypes import wintypes
+
+                # argtypes を宣言しないと HWND_TOPMOST(-1) が64bitに符号拡張されず、
+                # 例外も出ないまま「無効なハンドル」で毎回失敗する。
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.SetWindowPos.argtypes = [
+                    wintypes.HWND, wintypes.HWND,
+                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                    wintypes.UINT,
+                ]
+                user32.SetWindowPos.restype = wintypes.BOOL
 
                 HWND_TOPMOST = -1
                 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
-                ctypes.windll.user32.SetWindowPos(
+                ok = user32.SetWindowPos(
                     int(self.winId()), HWND_TOPMOST, 0, 0, 0, 0,
                     SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
                 )
+                if not ok:
+                    # raise_() に落とすと1.5秒ごとにフォーカスを奪いかねないので、記録だけする
+                    logger.debug(f"[UI] SetWindowPosに失敗しました: エラー {ctypes.get_last_error()}")
                 return
             except Exception as e:  # ctypesが使えない環境ではQtの方法に落とす
                 logger.debug(f"[UI] SetWindowPosに失敗しました: {e}")

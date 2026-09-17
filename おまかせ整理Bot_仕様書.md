@@ -149,7 +149,7 @@ def resolve_category(proposed_name, existing_categories):
 - スコアが高いファイルを「整理候補」として一覧提示
 - **実装方式：オンデマンド計算（常時監視・定期スキャンは行わない）**
   - 「放置ファイル」タブを開いたタイミングでDB上のアクティブファイルを対象にその場でスコアリングし、結果を表示する
-  - 「未アクセス期間」はアプリ内で当該ファイルを開いた記録（`last_accessed_at`）を優先して使用し、記録が無い場合はOSのファイル更新日時（mtime）で代用する（OSのatimeはWindows/Linuxとも標準設定で更新が信頼できないため使用しない）
+  - 「未アクセス期間」は`last_accessed_at` を使用する。この列は分類した時点で `created_at` と同じ値で初期化され、アプリ内でファイルを開くたびに更新される。`last_accessed_at` が `created_at` と等しければ一度も開かれていない。OSのatimeはWindows/Linuxとも標準設定で更新が信頼できず、mtimeはダウンロード日時と一致しないことがあるため、どちらも使用しない
   - バックグラウンドジョブやスケジューラを持たないため、実装・運用コストが低い
 
 ### 6.6 検索・管理UI機能（P1）
@@ -191,7 +191,7 @@ AIの分類は必ず外れる。外れたまま直せないと、ユーザーは
 | hash | TEXT | ファイルハッシュ（重複検出用） |
 | file_size | INTEGER | バイト数 |
 | created_at | DATETIME | 検出日時 |
-| last_accessed_at | DATETIME | 最終アクセス日時 |
+| last_accessed_at | DATETIME | 最終アクセス日時（分類時に created_at で初期化） |
 | status | TEXT | active / trashed |
 
 **categories テーブル**

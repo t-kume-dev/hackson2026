@@ -78,10 +78,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     古いスキーマのDBを開いた場合の埋め合わせ。
     embeddingカラムが無い時代のcategoriesテーブルが残っていても、
     既存の id / name のデータを保ったままカラムを追加する。
+    last_accessed_at が空のまま残っている行は created_at で埋める。
     """
     columns = [row[1] for row in conn.execute("PRAGMA table_info(categories)").fetchall()]
     if "embedding" not in columns:
         conn.execute("ALTER TABLE categories ADD COLUMN embedding BLOB")
+    # 分類時に last_accessed_at を入れる前に登録された行を埋める
+    conn.execute(
+        "UPDATE files SET last_accessed_at = created_at WHERE last_accessed_at IS NULL"
+    )
 
 
 def get_connection(db_path: Optional[Union[str, Path]] = None) -> sqlite3.Connection:
@@ -212,6 +217,9 @@ def insert_file(
     Returns:
         挿入した行のid（trash_log等から参照する際に使う）
     """
+    # 分類した時点を最初の「アクセス」とみなす。放置検出（T8）は常にこの列だけを見ればよい。
+    # 一度も開かれていないファイルは last_accessed_at == created_at で見分けられる。
+    now = datetime.now().isoformat()
     owns_conn = conn is None
     if owns_conn:
         conn = get_connection(db_path)
@@ -220,14 +228,14 @@ def insert_file(
             """
             INSERT INTO files
                 (path, filename, filetype, category, subtags, summary,
-                 embedding, hash, file_size, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                 embedding, hash, file_size, created_at, last_accessed_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
             """,
             (
                 path, Path(path).name, filetype, category,
                 json.dumps(subtags, ensure_ascii=False), summary,
                 to_blob(embedding), file_hash, file_size,
-                datetime.now().isoformat(),
+                now, now,
             ),
         )
         if owns_conn:
