@@ -39,6 +39,7 @@ from google import genai
 from google.genai import types
 
 import db
+from t4_classify import CATEGORY_SEPARATOR
 
 load_dotenv()
 
@@ -140,6 +141,11 @@ def get_category_names(db_path: DbPath = None) -> list[str]:
     return db.get_category_names(db_path)
 
 
+def _parent_parts(name: str) -> list[str]:
+    """フルパス名（例: "アニメ・ゲーム／鬼滅の刃"）から親階層のパーツ（末尾セグメントを除いたリスト）を取り出す。"""
+    return name.split(CATEGORY_SEPARATOR)[:-1]
+
+
 def resolve_category(
     proposed_category: str,
     db_path: DbPath = None,
@@ -150,78 +156,98 @@ def resolve_category(
     update_fn: Callable[[str, Vector, DbPath], None] = _update_embedding,
 ) -> str:
     """
-    T4が提案したカテゴリ名を、DB内の既存カテゴリ(embedding込み)と比較し、
-    実際に使うカテゴリ名を決定する。新規の場合はembeddingと一緒にDBへ登録する。
+    T4が提案したカテゴリパス（例: "アニメ・ゲーム／鬼滅の刃／グッズ写真"）を、
+    階層を1段ずつ降りながら「同じ親を持つ既存カテゴリ（兄弟）」とだけ比較し、
+    最終的に使うフルパスを決定する。新規の階層はembeddingと一緒にDBへ登録する。
     embeddingが未計算の既存カテゴリがあれば、この呼び出しの中でまとめて計算しキャッシュする。
 
     Args:
-        proposed_category: T4が提案したカテゴリ名（入力）
+        proposed_category: T4が提案したカテゴリのフルパス文字列（CATEGORY_SEPARATOR区切り）
         db_path: SQLiteファイルのパス。省略時は db.DB_PATH（通常は省略してよい）
         threshold: コサイン類似度の判定しきい値
         embed_fn / fetch_fn / register_fn / update_fn: テスト時に差し替え可能な依存関数
 
     Returns:
-        最終的に使うカテゴリ名（文字列）。
-        - 類似度がthreshold以上の既存カテゴリがあればそれを返す（DB登録はしない）
-        - 無ければproposed_categoryをembeddingと一緒にDBへ登録してそのまま返す
+        最終的に使うカテゴリのフルパス文字列。
         - proposed_categoryが空/Noneの場合は登録せず "未分類" を返す
+        - 各階層ごとに、類似度がthreshold以上の既存カテゴリがあればそちらの表記に置き換える
+        - 無ければその階層をembeddingと一緒にDBへ新規登録する
     """
     if not proposed_category or not proposed_category.strip():
         logger.warning("[T5] proposed_categoryが空です。'未分類'として扱います")
         return "未分類"
 
-    proposed_category = proposed_category.strip()
+    proposed_parts = [p.strip() for p in proposed_category.split(CATEGORY_SEPARATOR) if p.strip()]
+    if not proposed_parts:
+        logger.warning("[T5] proposed_categoryが空です。'未分類'として扱います")
+        return "未分類"
+
+    # 提案パスの各階層の累積フルパス（例: ["A", "A／B", "A／B／C"]）
+    proposed_levels = [
+        CATEGORY_SEPARATOR.join(proposed_parts[: i + 1]) for i in range(len(proposed_parts))
+    ]
 
     existing = fetch_fn(db_path)
     missing_names = [name for name, vec in existing if vec is None]
 
-    # 提案カテゴリ + embedding未計算の既存カテゴリをまとめて1回で問い合わせる
-    embeddings = embed_fn([proposed_category] + missing_names)
+    # 提案パスの各階層 + embedding未計算の既存カテゴリをまとめて1回のAPI呼び出しで問い合わせる
+    # （階層の深さが増えても呼び出し回数は変わらない。無料枠のクォータ節約のため）
+    embeddings = embed_fn(proposed_levels + missing_names)
 
     if embeddings is None:
         logger.error(f"[T5] embedding取得失敗のため新規カテゴリとして扱う: {proposed_category}")
-        register_fn(proposed_category, None, db_path)
+        for level_path in proposed_levels:
+            register_fn(level_path, None, db_path)
         return proposed_category
 
-    proposed_vec = embeddings[0]
-    missing_vecs = embeddings[1:]
+    proposed_vecs = dict(zip(proposed_levels, embeddings[: len(proposed_levels)]))
+    missing_vecs = embeddings[len(proposed_levels):]
 
     # 既存カテゴリのうち未計算だったものをDBに書き戻す（次回以降キャッシュが効く）
     for name, vec in zip(missing_names, missing_vecs):
         update_fn(name, vec, db_path)
 
-    vec_by_name: dict[str, Vector] = {
-        name: vec for name, vec in existing if vec is not None
-    }
+    vec_by_name: dict[str, Vector] = {name: vec for name, vec in existing if vec is not None}
     vec_by_name.update(zip(missing_names, missing_vecs))
 
-    if not vec_by_name:
-        logger.info(f"[T5] 既存カテゴリが無いため新規採用: {proposed_category}")
-        register_fn(proposed_category, proposed_vec, db_path)
-        return proposed_category
+    resolved_parts: list[str] = []
+    for i, proposed_full in enumerate(proposed_levels):
+        proposed_vec = proposed_vecs[proposed_full]
 
-    best_match: Optional[str] = None
-    best_score = -1.0
+        # 「今解決済みの親」の直下にある既存カテゴリ（兄弟）だけを比較対象にする
+        siblings = {
+            name: vec for name, vec in vec_by_name.items()
+            if _parent_parts(name) == resolved_parts
+        }
 
-    for name, vec in vec_by_name.items():
-        score = _cosine_similarity(proposed_vec, vec)
-        logger.debug(f"[T5] 類似度: '{proposed_category}' vs '{name}' = {score:.4f}")
-        if score > best_score:
-            best_score = score
-            best_match = name
+        if not siblings:
+            logger.info(f"[T5] 兄弟カテゴリが無いため新規採用: {proposed_full}")
+            register_fn(proposed_full, proposed_vec, db_path)
+            resolved_parts = proposed_parts[: i + 1]
+            continue
 
-    if best_match is not None and best_score >= threshold:
-        logger.info(
-            f"[T5] 類似度{best_score:.4f}が閾値{threshold}以上のため既存カテゴリを流用: "
-            f"'{proposed_category}' -> '{best_match}'"
-        )
-        return best_match
+        best_name: Optional[str] = None
+        best_score = -1.0
+        for name, vec in siblings.items():
+            score = _cosine_similarity(proposed_vec, vec)
+            logger.debug(f"[T5] 類似度: '{proposed_full}' vs '{name}' = {score:.4f}")
+            if score > best_score:
+                best_score, best_name = score, name
 
-    logger.info(
-        f"[T5] 最高類似度{best_score:.4f}が閾値{threshold}未満のため新規採用: {proposed_category}"
-    )
-    register_fn(proposed_category, proposed_vec, db_path)
-    return proposed_category
+        if best_name is not None and best_score >= threshold:
+            logger.info(
+                f"[T5] 類似度{best_score:.4f}が閾値{threshold}以上のため既存カテゴリを流用: "
+                f"'{proposed_full}' -> '{best_name}'"
+            )
+            resolved_parts = best_name.split(CATEGORY_SEPARATOR)
+        else:
+            logger.info(
+                f"[T5] 最高類似度{best_score:.4f}が閾値{threshold}未満のため新規採用: {proposed_full}"
+            )
+            register_fn(proposed_full, proposed_vec, db_path)
+            resolved_parts = proposed_parts[: i + 1]
+
+    return CATEGORY_SEPARATOR.join(resolved_parts)
 
 
 if __name__ == "__main__":

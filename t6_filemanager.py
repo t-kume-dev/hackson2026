@@ -32,6 +32,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 import db
+from t4_classify import CATEGORY_SEPARATOR
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +88,21 @@ def _calculate_hash(file_path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _move_to_category_folder(file_path: Path, category: str) -> Path:
-    """カテゴリフォルダへファイルを移動する"""
-    safe_category = "".join(
-        c for c in category
-        if c not in r'\/:*?"<>|'
-    ).strip() or "未分類"
+def _sanitize_folder_name(part: str) -> str:
+    """フォルダ名として使えない文字を除去する（階層の各パーツごとに個別に行う）"""
+    return "".join(c for c in part if c not in r'\/:*?"<>|').strip() or "未分類"
 
-    destination_dir = ORGANIZED_ROOT / safe_category
+
+def _move_to_category_folder(file_path: Path, category: str) -> Path:
+    """カテゴリフォルダへファイルを移動する（CATEGORY_SEPARATOR区切りで入れ子フォルダを作る）"""
+    # "アニメ・ゲーム／鬼滅の刃／グッズ写真" -> ["アニメ・ゲーム", "鬼滅の刃", "グッズ写真"]
+    parts = [_sanitize_folder_name(p) for p in category.split(CATEGORY_SEPARATOR) if p.strip()]
+    if not parts:
+        parts = ["未分類"]
+
+    destination_dir = ORGANIZED_ROOT
+    for part in parts:
+        destination_dir = destination_dir / part
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     destination = destination_dir / file_path.name

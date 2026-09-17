@@ -41,7 +41,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "gemini-3.6-flash"  # 無料枠対象。3.6系など有料限定モデルは避ける
+MODEL_NAME = "gemini-3.6-flash"  # 無料枠対象
+
+# カテゴリ階層の区切り文字と最大深さ。t5_dedupe.py もこの2つをimportして使う。
+CATEGORY_SEPARATOR = "／"
+MAX_CATEGORY_DEPTH = 3
 
 
 class ClassificationResult(TypedDict):
@@ -53,7 +57,10 @@ class ClassificationResult(TypedDict):
 _TEXT_PROMPT_TEMPLATE = """あなたはファイル整理アシスタントです。
 以下のファイル内容を分析し、最も適切な分類をJSON形式で1つだけ返してください。
 
-# 既存カテゴリ一覧
+分類は階層構造（親 > 子 > 孫）で表現し、意味のある深さまでで構いません。
+無理に{max_depth}階層まで分けず、それ以上細分化できないものは1〜2階層で止めてください。
+
+# 既存カテゴリ一覧（ツリー表示。合うものがあれば表記も揃えて使う）
 {categories}
 
 # ファイル内容
@@ -61,7 +68,7 @@ _TEXT_PROMPT_TEMPLATE = """あなたはファイル整理アシスタントで�
 
 # 出力形式（このJSON以外は何も出力しないこと）
 {{
-  "category": "分類名（既存カテゴリに合うものがあればそれを使う。なければ新規名を提案する）",
+  "category_path": ["第1階層", "第2階層(あれば)", "第3階層(あれば)"],
   "subtags": ["関連キーワード1", "関連キーワード2"],
   "summary": "内容の要約（100文字以内）"
 }}
@@ -70,20 +77,35 @@ _TEXT_PROMPT_TEMPLATE = """あなたはファイル整理アシスタントで�
 _IMAGE_PROMPT_TEMPLATE = """あなたはファイル整理アシスタントです。
 添付された画像の内容を見て、最も適切な分類をJSON形式で1つだけ返してください。
 
-# 既存カテゴリ一覧
+分類は階層構造（親 > 子 > 孫）で表現し、意味のある深さまでで構いません。
+無理に{max_depth}階層まで分けず、それ以上細分化できないものは1〜2階層で止めてください。
+
+# 既存カテゴリ一覧（ツリー表示。合うものがあれば表記も揃えて使う）
 {categories}
 
 # 出力形式（このJSON以外は何も出力しないこと）
 {{
-  "category": "分類名（既存カテゴリに合うものがあればそれを使う。なければ新規名を提案する）",
+  "category_path": ["第1階層", "第2階層(あれば)", "第3階層(あれば)"],
   "subtags": ["関連キーワード1", "関連キーワード2"],
   "summary": "画像の内容の要約（100文字以内）"
 }}
 """
 
 
-def _categories_text(existing_categories: List[str]) -> str:
-    return "\n".join(f"- {c}" for c in existing_categories) or "(まだ登録なし)"
+def _categories_tree_text(existing_categories: List[str]) -> str:
+    """
+    フルパス文字列のリスト（例: "アニメ・ゲーム／鬼滅の刃"）から
+    インデント付きツリー表示を組み立てる。DBはフラットなままなので、
+    表示専用の変換としてここでだけ行う。
+    """
+    if not existing_categories:
+        return "(まだ登録なし)"
+    lines = []
+    for path in sorted(existing_categories):
+        parts = path.split(CATEGORY_SEPARATOR)
+        indent = "  " * (len(parts) - 1)
+        lines.append(f"{indent}- {parts[-1]}")
+    return "\n".join(lines)
 
 
 def _parse_response(raw_text: str) -> Optional[ClassificationResult]:
@@ -99,14 +121,29 @@ def _parse_response(raw_text: str) -> Optional[ClassificationResult]:
         logger.error(f"[T4] レスポンスのJSONパースに失敗: {e} / raw={raw_text[:200]!r}")
         return None
 
-    required_keys = ("category", "subtags", "summary")
+    required_keys = ("category_path", "subtags", "summary")
     missing = [k for k in required_keys if k not in data]
     if missing:
         logger.error(f"[T4] レスポンスに必要なキーが不足: {missing} / data={data}")
         return None
 
+    category_path = data["category_path"]
+    if not isinstance(category_path, list) or not category_path:
+        logger.error(f"[T4] category_pathが不正な形式です: {category_path!r}")
+        return None
+
+    # 区切り文字が万一そのままセグメントに混ざると階層がズレるので潰す。深さも上限で切る。
+    safe_parts = [
+        str(p).strip().replace(CATEGORY_SEPARATOR, "・")
+        for p in category_path[:MAX_CATEGORY_DEPTH]
+        if str(p).strip()
+    ]
+    if not safe_parts:
+        logger.error(f"[T4] category_pathが空になりました: {category_path!r}")
+        return None
+
     return {
-        "category": data["category"],
+        "category": CATEGORY_SEPARATOR.join(safe_parts),
         "subtags": data["subtags"],
         "summary": data["summary"],
     }
@@ -138,7 +175,7 @@ def classify_content(
 
     filetype = t3_output.get("filetype")
     file_path = t3_output.get("file_path", "(不明)")
-    categories_text = _categories_text(existing_categories)
+    categories_text = _categories_tree_text(existing_categories)
 
     # --- filetypeでテキスト系 / 画像系に分岐 ---
     if filetype in ("text", "pdf"):
@@ -146,7 +183,9 @@ def classify_content(
         if content is None:
             logger.error(f"[T4] content が見つかりません: {file_path}")
             return None
-        prompt = _TEXT_PROMPT_TEMPLATE.format(categories=categories_text, content=content)
+        prompt = _TEXT_PROMPT_TEMPLATE.format(
+            categories=categories_text, content=content, max_depth=MAX_CATEGORY_DEPTH
+        )
         contents: list = [prompt]
 
     elif filetype == "photo":
@@ -155,7 +194,7 @@ def classify_content(
         if image_bytes is None or mime_type is None:
             logger.error(f"[T4] image_bytes / mime_type が不足しています: {file_path}")
             return None
-        prompt = _IMAGE_PROMPT_TEMPLATE.format(categories=categories_text)
+        prompt = _IMAGE_PROMPT_TEMPLATE.format(categories=categories_text, max_depth=MAX_CATEGORY_DEPTH)
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
         contents = [prompt, image_part]
 
@@ -174,6 +213,11 @@ def classify_content(
                 contents=contents,
             )
             raw_text = response.text
+            if raw_text is None:
+                # 安全フィルター等でcandidatesが空の場合、response.textが例外を出さずNoneを返すことがある。
+                # ここで例外化してリトライに乗せないと、次の_parse_response呼び出しで
+                # AttributeErrorとなり分類処理全体が落ちてしまう。
+                raise ValueError("レスポンスにtextがありません（安全フィルター等の可能性）")
         except Exception as e:
             last_error = e
             wait_seconds = 2 ** (attempt - 1)  # 1秒 -> 2秒 -> 4秒
