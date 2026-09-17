@@ -50,7 +50,7 @@ torch は sentence-transformers が依存として引いてくるので明記し
 
 | 対象 | 内容 |
 |---|---|
-| `.env` | `GEMINI_API_KEY=<各自のキー>` の1行。**無いと分類が全部失敗します**（UIは起動する） |
+| `.env` | `OPENAI_API_KEY=<キー>` の1行（有料キー。ユーザー本人のものではない）。**無いと分類が全部失敗します**（UIは起動する）。`GEMINI_API_KEY` は使っていない |
 | `omakase.db` | 実行すれば自動で作られる |
 | `organized/` | 同上。分類されたファイルの置き場 |
 
@@ -77,7 +77,7 @@ T1 t1_watch.watch_folder         フォルダ監視（watchdog、新規ファイ
 T2 t2_screening.screen_file      処理対象かの判定＋種別(text/pdf/photo)
 T3 t3_content.extract_content    中身の抽出（画像はbytesのままT4へ）
 T4 t4_classify.classify_content  Gemini APIで カテゴリ/サブタグ/要約 を生成
-T5 t5_dedupe.resolve_category    カテゴリの表記ゆれをembeddingで統合
+T5 t5_dedupe.resolve_category    カテゴリを階層ごとに既存の表記へ揃える（表記の正規化のみ）
 T6 t6_filemanager.save_result    カテゴリフォルダへ移動＋DB保存
    t6_filemanager.recategorize   分類の訂正（別カテゴリへ移し直す）
 T7 t7_search.search              自然文で意味検索
@@ -176,7 +176,7 @@ T8の片付けタイムもこのログに流しています。T9のUndoも同じ
 - **DBファイルのパスは `db.DB_PATH`（= `omakase.db`）ただ1つが正。**
   相対パスを書くと実行場所次第で別のDBが作られ、データが消えたように見えます
 - テーブルは仕様書8章どおり `files` / `categories` / `trash_log` の3つ
-- `categories.embedding` はNULL許容（T5がAPI失敗時に名前だけ先に登録するため）
+- `categories.embedding` は現在使っていない（T5がembeddingをやめたため常にNULL）
 - T6はfilesとtrash_logのINSERTを1トランザクションにまとめています
 - `files.last_accessed_at` は**分類した時点**で `created_at` と同じ値が入り、
   以降は**アプリ経由で開いたとき**に更新されます（`t7_search.open_file()`）。
@@ -188,11 +188,10 @@ T7で足した関数: `get_active_files()` / `get_file()` / `touch_file()` /
 T8で足したもの: `files.kept_at` 列（「残す」を押した日時。古いDBには `_migrate()` で追加）、
 `set_kept()` / `mark_trashed()`（status・パスの更新と `trash_log` の `delete` 記録を1トランザクションで行う）
 
-### embeddingは2種類ある
+### embedding
 
 | 保存先 | モデル | 次元 | 用途 |
 |---|---|---|---|
-| `categories.embedding` | Gemini `gemini-embedding-001` | 3072 | T5のカテゴリ表記ゆれ判定 |
 | `files.embedding` | `intfloat/multilingual-e5-base`（ローカル） | 768 | T7の検索、訂正候補の並べ替え |
 
 `files.embedding` と比べるベクトルは、必ず `t6_filemanager.embed_query()` で作ってください。
@@ -257,9 +256,6 @@ T8以前の項目（6章の1〜23）は、ユーザーが一通り確認済み�
 
 ### (D) 未決事項
 
-- **Gemini APIの課金プラン確認**: モデルは `gemini-3.6-flash`（`gemini-2.5-flash` は新規ユーザーに404）。
-  `t4_classify.py` に「3.6系など有料限定モデルは避ける」というコメントがあるが、実際には3.6-flashで応答が返っており、
-  コメントが実態と食い違っている。Google AI Studioでプランを確認してコメントを直すこと
 - **訂正の学習**: 訂正はその場限りで、同種のファイルが来るとまた同じ間違いをする（仕様書12.2）
 - **`epic1.py` と `test_t2_read_failure.py`** が配線から外れたまま残っている。現役か要確認
 - **グローバルホットキー**（Ctrl+Space等でどこからでも呼ぶ）は未実装。Qtには標準の手段が無い
@@ -316,6 +312,15 @@ T8以前の項目（6章の1〜23）は、ユーザーが一通り確認済み�
 ---
 
 ## 7. 踏んだ罠
+
+- **AIはOpenAIに移行した（Geminiには戻さない）**: Geminiの無料枠は分類が1日20回で、テスト中に尽きた。
+  T4は `.env` の `OPENAI_API_KEY` を見て OpenAI（既定 `gpt-5.5`、`OPENAI_MODEL` で変更可）を使う。
+  26件の自作データで gpt-5-mini / gpt-5.4-mini / gpt-4.1-mini / gpt-5.4 と比べ、gpt-5.5 が最も妥当だった。
+  miniモデルは既存カテゴリへ無関係なファイルを押し込む（論文→統計学、議事録→旅行）ので使わない
+- **T5のembedding統合は誤統合していた**: カテゴリをフルパス（「契約書／雇用契約書」）でembeddingすると、
+  共通の親に引っ張られて別物同士が0.93〜0.98になり、雇用契約書→賃貸借契約書、重回帰→単回帰と誤って統合した。
+  末尾の名前だけにしても「単回帰/重回帰 0.945」と「写真/画像 0.946」が重なり、しきい値で分けられない。
+  そこでT5は表記の正規化（全角半角・大小・空白）だけにし、意味の統合はT4のプロンプト（既存の表記をそのまま使う）に任せた
 
 - **PyQt6はこのPCで使えない**: Windowsのアプリケーション制御ポリシーがDLLをブロックし、importすら通らない。
   Qt公式の署名付きバイナリである **PySide6** を使っている。違いはシグナル定義が `Signal` になる点だけ。戻さないこと
