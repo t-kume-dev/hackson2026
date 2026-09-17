@@ -1,5 +1,5 @@
 """
-コハク: デスクトップ常駐の相棒UI（PySide6）
+MOFU: デスクトップ常駐の相棒UI（PySide6）
 
 デスクトップの隅にキャラが浮かんでいて、
 - ダウンロードを検出したら吹き出しで「どこに入れたか」を知らせる（自発）
@@ -93,7 +93,7 @@ INVITE_INTERVAL = timedelta(hours=24)      # 声かけは1日1回まで
 INVITE_RETRY_MS = 10 * 1000                # 通知中・分類中なら少し待って出し直す
 
 # フォントは2系統に分ける。
-# - VOICE: コハクの「声」（吹き出し・ボタン・タイトル）。同梱のドット絵フォント DotGothic16。
+# - VOICE: MOFUの「声」（吹き出し・ボタン・タイトル）。同梱のドット絵フォント DotGothic16。
 #   16px基準のフォントなので、それより小さくすると潰れて読めなくなる。14px以上で使う。
 # - TEXT: ファイル名・要約など情報量の多い部分。小さくても読める普通のUIフォント。
 #   全部ドット絵フォントにすると、世界観は揃うが実用に耐えない（実際に見づらかった）。
@@ -209,8 +209,8 @@ class Bubble(QFrame):
 
     def __init__(self, text: str, mine: bool = False) -> None:
         super().__init__()
-        # コハクの発言は黒地に白枠（指定どおり）、自分の発言は枠なしの白地。
-        # 白枠を持つのはコハクの吹き出しだけにして、会話の主役を分かりやすくする。
+        # MOFUの発言は黒地に白枠（指定どおり）、自分の発言は枠なしの白地。
+        # 白枠を持つのはMOFUの吹き出しだけにして、会話の主役を分かりやすくする。
         if mine:
             frame = f"background:{WHITE}; border:0;"
             fg = BLACK
@@ -487,7 +487,7 @@ class ChatPanel(QWidget):
         row = QHBoxLayout(header)
         row.setContentsMargins(16, 12, 12, 12)
 
-        title = QLabel("コハク")
+        title = QLabel("MOFU")
         title.setStyleSheet(f"color:{WHITE}; font-size:18px; font-family:{VOICE};")
         row.addWidget(title)
 
@@ -581,7 +581,7 @@ class ChatPanel(QWidget):
         self._follow = value >= bar.maximum() - 8
 
     def say(self, text: str) -> Bubble:
-        """コハク側の発言。"""
+        """MOFU側の発言。"""
         return self._append(Bubble(text))
 
     def say_user(self, text: str) -> Bubble:
@@ -1361,10 +1361,10 @@ class Kohaku:
         _draw_sprite(painter, SPRITE_IDLE, -2, 0, 2)
         painter.end()
         tray = QSystemTrayIcon(QIcon(pixmap))
-        tray.setToolTip("コハク")
+        tray.setToolTip("MOFU")
 
         menu = QMenu()
-        open_action = QAction("コハクと話す", menu)
+        open_action = QAction("MOFUと話す", menu)
         open_action.triggered.connect(self.panel.show_panel)
         menu.addAction(open_action)
         tidy_action = QAction("片付けタイム", menu)
@@ -1388,7 +1388,7 @@ class Kohaku:
 
     def show_menu(self, at: QPoint) -> None:
         menu = QMenu()
-        talk = QAction("コハクと話す", menu)
+        talk = QAction("MOFUと話す", menu)
         talk.triggered.connect(self.panel.show_panel)
         menu.addAction(talk)
         tidy = QAction("片付けタイム", menu)
@@ -1505,12 +1505,12 @@ def run(watch_dir: str) -> int:
     app.setQuitOnLastWindowClosed(False)  # パネルを閉じても常駐を続ける
     _load_pixel_font()
     app.setFont(QFont("DotGothic16", 10))
-    app.setApplicationName("コハク")
+    app.setApplicationName("MOFU")
 
     Kohaku(app, watch_dir)
 
-    print(f"[コハク] 監視開始: {watch_dir}")
-    print("[コハク] 左下のキャラをクリックすると話せます。終了はキャラを右クリック。")
+    print(f"[MOFU] 監視開始: {watch_dir}")
+    print("[MOFU] 左下のキャラをクリックすると話せます。終了はキャラを右クリック。")
 
     return app.exec()
 
